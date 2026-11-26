@@ -280,7 +280,8 @@ void MacroblockView::paintEvent(QPaintEvent *)
         }
     } else if (m_showQp && frame.decodedUnitsReady) {
         painter.setPen(Qt::NoPen);
-        const double maximumQp = m_stream->codec == Codec::Mpeg4Visual ? 31.0 : 51.0;
+        const double maximumQp = m_stream->codec == Codec::Mpeg4Visual ? 31.0
+            : (m_stream->codec == Codec::Av1 ? 255.0 : 51.0);
         for (const auto &unit : frame.decodedUnits) {
             if (unit.qp < 0 || unit.column < 0 || unit.row < 0)
                 continue;
@@ -392,9 +393,11 @@ void MacroblockView::mouseMoveEvent(QMouseEvent *event)
             return address >= candidate.start && address < candidate.end;
         });
     const bool hevc = m_stream->codec == Codec::Hevc;
-    const QString unit = hevc ? QStringLiteral("CTU 根单元") : QStringLiteral("宏块");
+    const bool av1 = m_stream->codec == Codec::Av1;
+    const QString unit = hevc ? QStringLiteral("CTU 根单元")
+        : (av1 ? QStringLiteral("Superblock 根单元") : QStringLiteral("宏块"));
     const QString pictureUnit = m_stream->codec == Codec::Mpeg4Visual
-        ? QStringLiteral("VOP") : QStringLiteral("Slice");
+        ? QStringLiteral("VOP") : (av1 ? QStringLiteral("Frame OBU") : QStringLiteral("Slice"));
     const QString slice = region == frame.regions.end()
         ? QStringLiteral("当前帧 %1 未覆盖").arg(pictureUnit)
         : QStringLiteral("%1 #%2 · %3").arg(pictureUnit)
@@ -429,6 +432,8 @@ void MacroblockView::mouseMoveEvent(QMouseEvent *event)
         const auto &unitInfo = frame.decodedUnits.at(address);
         decoded = QStringLiteral("实际 QP %1 · %2 · 类型码 %3")
             .arg(unitInfo.qp).arg(unitInfo.category, unitInfo.decoderType);
+    } else if (av1) {
+        decoded = QStringLiteral("AV1 根 Superblock；块级 QIndex/分区需要熵解码器导出");
     } else if (!frame.decodedUnitsError.isEmpty()) {
         decoded = frame.decodedUnitsError;
     } else {

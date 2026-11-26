@@ -17,7 +17,7 @@ int main(int argc, char *argv[]) {
     QApplication::setOrganizationDomain(QStringLiteral("bitscope.local"));
 
     QCommandLineParser parser;
-    parser.setApplicationDescription(QStringLiteral("跨平台 MP4、H.264 / H.265 / MPEG-4 Part 2 码流分析器"));
+    parser.setApplicationDescription(QStringLiteral("跨平台 MP4、H.264 / H.265 / MPEG-4 Part 2 / AV1 码流分析器"));
     parser.addHelpOption();
     parser.addVersionOption();
     QCommandLineOption analyzeOption(QStringList{QStringLiteral("a"), QStringLiteral("analyze")}, QStringLiteral("解析文件并以 JSON 输出摘要，不显示界面"), QStringLiteral("file"));
@@ -26,7 +26,7 @@ int main(int argc, char *argv[]) {
     parser.addOption(analyzeOption);
     parser.addOption(screenshotOption);
     parser.addOption(fileViewOption);
-    parser.addPositionalArgument(QStringLiteral("file"), QStringLiteral("启动后打开的 MP4、H.264、H.265 或 MPEG-4 Part 2 文件"), QStringLiteral("[file]"));
+    parser.addPositionalArgument(QStringLiteral("file"), QStringLiteral("启动后打开的 MP4、H.264、H.265、MPEG-4 Part 2 或 AV1 文件"), QStringLiteral("[file]"));
     parser.process(app);
 
     if (parser.isSet(analyzeOption)) {
@@ -35,8 +35,19 @@ int main(int argc, char *argv[]) {
             {QStringLiteral("codec"), stream->codecName()}, {QStringLiteral("format"), stream->format},
             {QStringLiteral("container"), stream->containerFile}, {QStringLiteral("top_level_boxes"), stream->boxes.size()},
             {QStringLiteral("width"), stream->width}, {QStringLiteral("height"), stream->height},
+            {QStringLiteral("bit_depth"), stream->bitDepth}, {QStringLiteral("chroma_format"), stream->chroma},
+            {QStringLiteral("profile_name"), stream->profileName},
             {QStringLiteral("fps"), stream->fps}, {QStringLiteral("frames"), stream->frames.size()},
             {QStringLiteral("nals"), stream->nals.size()}, {QStringLiteral("units"), stream->nals.size()}, {QStringLiteral("duration"), stream->duration}};
+        QJsonObject frameTypes;
+        for (const auto &frame : stream->frames)
+            frameTypes.insert(frame.displayType, frameTypes.value(frame.displayType).toInt() + 1);
+        int parseErrors = 0;
+        for (const auto &unit : stream->nals)
+            for (const auto &syntaxField : unit.fields)
+                if (syntaxField.name == QStringLiteral("parse_error")) ++parseErrors;
+        result.insert(QStringLiteral("frame_types"), frameTypes);
+        result.insert(QStringLiteral("unit_parse_errors"), parseErrors);
         if (!stream->frames.isEmpty()) {
             const auto &first = stream->frames.first();
             result.insert(QStringLiteral("first_frame_type"), first.displayType);

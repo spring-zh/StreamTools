@@ -103,8 +103,8 @@ int PreviewProvider::nearestStart(int frameIndex) const
 }
 
 QByteArray PreviewProvider::accessUnit(int frameIndex,bool includeParameters) const {
-    QByteArray out;QSet<int> seen;QVector<int> indices;if(includeParameters)indices+=m_stream->parameterNalIndices;indices+=m_stream->frames.at(frameIndex).nalIndices;
-    for(int index:indices){if(seen.contains(index)||index<0||index>=m_stream->nals.size())continue;seen.insert(index);out.append("\0\0\0\1",4);out.append(m_stream->nals.at(index).payload);}return out;
+    QByteArray out;if(m_stream->codec==Codec::Av1){out.append(char(0x12));out.append(char(0x00));}QSet<int> seen;QVector<int> indices;if(includeParameters)indices+=m_stream->parameterNalIndices;indices+=m_stream->frames.at(frameIndex).nalIndices;
+    for(int index:indices){if(seen.contains(index)||index<0||index>=m_stream->nals.size())continue;seen.insert(index);if(m_stream->codec==Codec::Av1&&m_stream->nals.at(index).nalType==2)continue;if(m_stream->codec!=Codec::Av1)out.append("\0\0\0\1",4);out.append(m_stream->nals.at(index).payload);}return out;
 }
 
 QByteArray PreviewProvider::segment(int first,int last) const {QByteArray out;for(int i=first;i<=last;++i)out.append(accessUnit(i,i==first));return out;}
@@ -114,13 +114,13 @@ void PreviewProvider::processQueue(){if(!m_stream||m_pending.isEmpty()||m_proces
     for(int index:sorted){if(nearestStart(index)==m_activeStart&&index<=anchor+64){m_activeRequested.push_back(index);m_activeEnd=std::max(m_activeEnd,index);}}
     for(int index:m_activeRequested)m_pending.remove(index);
     m_activeOutputOrder.clear();for(int index=m_activeStart;index<=m_activeEnd;++index)m_activeOutputOrder.push_back(index);if(m_stream->codec==Codec::Mpeg4Visual)std::stable_sort(m_activeOutputOrder.begin(),m_activeOutputOrder.end(),[this](int a,int b){return m_stream->frames.at(a).pts<m_stream->frames.at(b).pts;});
-    const QString suffix=m_stream->codec==Codec::Avc?QStringLiteral("h264"):(m_stream->codec==Codec::Hevc?QStringLiteral("h265"):QStringLiteral("m4v"));
+    const QString suffix=m_stream->codec==Codec::Avc?QStringLiteral("h264"):(m_stream->codec==Codec::Hevc?QStringLiteral("h265"):(m_stream->codec==Codec::Mpeg4Visual?QStringLiteral("m4v"):QStringLiteral("obu")));
     const int job=m_job++;m_activePrefix=QDir(m_temp.path()).filePath(QStringLiteral("preview_%1_").arg(job));m_activeInput=QDir(m_temp.path()).filePath(QStringLiteral("preview_%1.%2").arg(job).arg(suffix));QFile input(m_activeInput);if(!input.open(QIODevice::WriteOnly)){for(int index:m_activeRequested)Q_EMIT previewFailed(index,input.errorString());m_queueTimer.start();return;}input.write(segment(m_activeStart,m_activeEnd));input.close();
     const QString output=m_activePrefix+QStringLiteral("%05d.jpg");const QString fps=QString::number(m_stream->fps,'f',3);
-    const bool macroblockDebug=m_stream->codec!=Codec::Hevc;
+    const bool macroblockDebug=m_stream->codec==Codec::Avc||m_stream->codec==Codec::Mpeg4Visual;
     QStringList args{QStringLiteral("-hide_banner"),QStringLiteral("-loglevel"),macroblockDebug?QStringLiteral("debug"):QStringLiteral("error")};
     if(macroblockDebug)args<<QStringLiteral("-threads")<<QStringLiteral("1")<<QStringLiteral("-debug")<<QStringLiteral("qp+mb_type")<<QStringLiteral("-probesize")<<QStringLiteral("32")<<QStringLiteral("-analyzeduration")<<QStringLiteral("0");
-    const QString demuxer=m_stream->codec==Codec::Avc?QStringLiteral("h264"):(m_stream->codec==Codec::Hevc?QStringLiteral("hevc"):QStringLiteral("m4v"));
+    const QString demuxer=m_stream->codec==Codec::Avc?QStringLiteral("h264"):(m_stream->codec==Codec::Hevc?QStringLiteral("hevc"):(m_stream->codec==Codec::Mpeg4Visual?QStringLiteral("m4v"):QStringLiteral("obu")));
     args<<QStringLiteral("-fflags")<<QStringLiteral("+genpts")<<QStringLiteral("-err_detect")<<QStringLiteral("ignore_err")<<QStringLiteral("-flags")<<QStringLiteral("+output_corrupt")<<QStringLiteral("-r")<<fps<<QStringLiteral("-f")<<demuxer<<QStringLiteral("-i")<<m_activeInput<<QStringLiteral("-an")<<QStringLiteral("-vf")<<QStringLiteral("scale=320:-2")<<QStringLiteral("-fps_mode")<<QStringLiteral("passthrough")<<QStringLiteral("-q:v")<<QStringLiteral("5")<<QStringLiteral("-start_number")<<QStringLiteral("0")<<QStringLiteral("-frames:v")<<QString::number(m_activeEnd-m_activeStart+1)<<QStringLiteral("-y")<<output;
     Q_EMIT statusChanged(QStringLiteral("正在生成预览 F%1–F%2 · %3").arg(m_activeStart).arg(m_activeEnd).arg(executable));m_process.start(executable,args);
 }
@@ -138,7 +138,8 @@ void PreviewProvider::processFinished(int exitCode, QProcess::ExitStatus status)
             Q_EMIT decodedUnitsUnavailable(index, reason.left(300));
         }
     } else {
-        if (m_stream && m_stream->codec != Codec::Hevc) {
+        if (m_stream && (m_stream->codec == Codec::Avc
+                         || m_stream->codec == Codec::Mpeg4Visual)) {
             const int expected = m_activeEnd - m_activeStart + 1;
             const auto decoded = parseAvcDecodedUnits(stderrData, expected);
             for (int relative = 0; relative < decoded.size() && relative < expected; ++relative) {
@@ -184,7 +185,9 @@ QVector<QVector<DecodedUnitInfo>> PreviewProvider::parseAvcDecodedUnits(const QB
                                                                         int expectedFrames) const
 {
     QVector<QVector<DecodedUnitInfo>> result;
-    if (!m_stream || m_stream->codec == Codec::Hevc || expectedFrames <= 0)
+    if (!m_stream || (m_stream->codec != Codec::Avc
+                      && m_stream->codec != Codec::Mpeg4Visual)
+        || expectedFrames <= 0)
         return result;
     const int columns = int(std::ceil(double(m_stream->width) / 16.0));
     const int rows = int(std::ceil(double(m_stream->height) / 16.0));

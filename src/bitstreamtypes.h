@@ -11,7 +11,7 @@
 
 namespace bitscope {
 
-enum class Codec { Avc, Hevc, Mpeg4Visual };
+enum class Codec { Avc, Hevc, Mpeg4Visual, Av1 };
 
 struct SyntaxField {
     QString name;
@@ -55,6 +55,11 @@ struct SliceInfo {
     int quantizer = -1;
     int timeIncrement = -1;
     bool coded = true;
+    bool showFrame = true;
+    bool showExistingFrame = false;
+    int frameToShowMapIndex = -1;
+    int refreshFrameFlags = 0;
+    QVector<int> referenceSlots;
     QVector<SyntaxField> fields;
 };
 
@@ -166,6 +171,22 @@ struct ParameterSetInfo {
     int quantPrecision = 5;
     int shape = 0;
     bool interlaced = false;
+    bool reducedStillPictureHeader = false;
+    bool decoderModelInfoPresent = false;
+    bool frameIdNumbersPresent = false;
+    int deltaFrameIdLength = 0;
+    int additionalFrameIdLength = 0;
+    int frameWidthBits = 0;
+    int frameHeightBits = 0;
+    bool use128x128Superblock = false;
+    bool enableOrderHint = false;
+    int orderHintBits = 0;
+    int forceScreenContentTools = 0;
+    int forceIntegerMv = 0;
+    bool enableSuperres = false;
+    bool enableCdef = false;
+    bool enableRestoration = false;
+    bool filmGrainParamsPresent = false;
     double fps = 0.0;
     QVector<SyntaxField> fields;
 };
@@ -199,7 +220,8 @@ struct StreamInfo {
     QString codecName() const {
         if (codec == Codec::Avc) return QStringLiteral("H.264 / AVC");
         if (codec == Codec::Hevc) return QStringLiteral("H.265 / HEVC");
-        return QStringLiteral("MPEG-4 Part 2 Visual");
+        if (codec == Codec::Mpeg4Visual) return QStringLiteral("MPEG-4 Part 2 Visual");
+        return QStringLiteral("AV1");
     }
 };
 

@@ -17,6 +17,8 @@ namespace {
 struct RawUnit { qint64 offset = 0; int startCode = 0; QByteArray payload; bool lengthPrefixed = false; int sampleIndex = -1; };
 
 QVector<RawUnit> splitUnits(const QByteArray &bytes);
+QVector<RawUnit> splitAv1Obus(const QByteArray &bytes, qint64 baseOffset = 0,
+                              int sampleIndex = -1);
 
 void field(QVector<SyntaxField> &target, const QString &name, const QVariant &value,
            const QString &bits = {}, const QString &description = {}) {
@@ -43,6 +45,86 @@ quint32 be24(const QByteArray &data, qint64 pos) {
 
 quint64 be64(const QByteArray &data, qint64 pos) {
     return (quint64(be32(data, pos)) << 32U) | quint64(be32(data, pos + 4));
+}
+
+quint16 le16(const QByteArray &data, qint64 pos) {
+    if (pos < 0 || pos + 2 > data.size()) return 0;
+    return quint16(quint8(data.at(pos))) | (quint16(quint8(data.at(pos + 1))) << 8U);
+}
+
+quint32 le32(const QByteArray &data, qint64 pos) {
+    if (pos < 0 || pos + 4 > data.size()) return 0;
+    return quint32(quint8(data.at(pos))) | (quint32(quint8(data.at(pos + 1))) << 8U)
+        | (quint32(quint8(data.at(pos + 2))) << 16U)
+        | (quint32(quint8(data.at(pos + 3))) << 24U);
+}
+
+quint64 le64(const QByteArray &data, qint64 pos) {
+    return quint64(le32(data, pos)) | (quint64(le32(data, pos + 4)) << 32U);
+}
+
+bool readLeb128(const QByteArray &data, int &position, int end, quint64 &value,
+                int *encodedBytes = nullptr) {
+    value = 0;
+    int shift = 0;
+    const int begin = position;
+    while (position < end && position < data.size() && position - begin < 8) {
+        const quint8 byte = quint8(data.at(position++));
+        value |= quint64(byte & 0x7f) << shift;
+        if (!(byte & 0x80)) {
+            if (encodedBytes) *encodedBytes = position - begin;
+            return true;
+        }
+        shift += 7;
+    }
+    position = begin;
+    return false;
+}
+
+struct Av1ObuHeader {
+    int type = 0;
+    bool extension = false;
+    bool hasSize = false;
+    int temporalId = 0;
+    int spatialId = 0;
+    int headerBytes = 0;
+    int sizeBytes = 0;
+    int payloadOffset = 0;
+    int payloadSize = 0;
+};
+
+Av1ObuHeader av1ObuHeader(const QByteArray &obu) {
+    Av1ObuHeader result;
+    if (obu.isEmpty()) throw std::runtime_error("Empty AV1 OBU");
+    const quint8 header = quint8(obu.at(0));
+    if (header & 0x80) throw std::runtime_error("Invalid AV1 OBU forbidden bit");
+    result.type = (header >> 3) & 0x0f;
+    result.extension = (header & 0x04) != 0;
+    result.hasSize = (header & 0x02) != 0;
+    int position = 1;
+    if (result.extension) {
+        if (position >= obu.size()) throw std::runtime_error("Truncated AV1 OBU extension");
+        const quint8 extension = quint8(obu.at(position++));
+        result.temporalId = (extension >> 5) & 0x07;
+        result.spatialId = (extension >> 3) & 0x03;
+    }
+    result.headerBytes = position;
+    if (result.hasSize) {
+        quint64 payloadSize = 0;
+        if (!readLeb128(obu, position, obu.size(), payloadSize, &result.sizeBytes)
+            || payloadSize > quint64(obu.size() - position))
+            throw std::runtime_error("Invalid AV1 OBU size field");
+        result.payloadSize = int(payloadSize);
+    } else {
+        result.payloadSize = obu.size() - position;
+    }
+    result.payloadOffset = position;
+    return result;
+}
+
+QByteArray av1ObuPayload(const QByteArray &obu) {
+    const Av1ObuHeader header = av1ObuHeader(obu);
+    return obu.mid(header.payloadOffset, header.payloadSize);
 }
 
 QString fourcc(const QByteArray &data, qint64 pos) {
@@ -90,7 +172,9 @@ QString boxDescription(const QString &type) {
         {"stss", "同步采样表"}, {"avc1", "H.264 视频采样项"}, {"avc3", "H.264 视频采样项"},
         {"hvc1", "H.265 视频采样项"}, {"hev1", "H.265 视频采样项"},
         {"mp4v", "MPEG-4 Part 2 视频采样项"},
+        {"av01", "AV1 视频采样项"},
         {"avcC", "AVC 解码配置"}, {"hvcC", "HEVC 解码配置"},
+        {"av1C", "AV1 Codec Configuration Record"},
         {"esds", "Elementary Stream Descriptor"},
         {"mdat", "媒体数据"}, {"free", "空闲空间"}, {"skip", "保留空间"},
         {"edts", "编辑列表容器"}, {"elst", "编辑列表"}, {"udta", "用户数据"},
@@ -103,7 +187,7 @@ QString boxDescription(const QString &type) {
 bool isBoxContainer(const QString &type) {
     static const QSet<QString> containers{"moov","trak","mdia","minf","dinf","stbl","edts","udta",
         "meta","ilst","moof","traf","mvex","mfra","ipro","sinf","schi","wave","stsd",
-        "avc1","avc3","hvc1","hev1","mp4v","encv","mp4a","enca"};
+        "avc1","avc3","hvc1","hev1","mp4v","av01","encv","mp4a","enca"};
     return containers.contains(type);
 }
 
@@ -142,7 +226,7 @@ void addBoxFields(Mp4BoxInfo &box, const QByteArray &data) {
     } else if (box.type == "stsz" && payload + 12 <= end) {
         field(box.fields, "sample_size", be32(data, payload + 4), "u(32)");
         field(box.fields, "sample_count", be32(data, payload + 8), "u(32)");
-    } else if (QSet<QString>{"avc1","avc3","hvc1","hev1","mp4v"}.contains(box.type) && payload + 28 <= end) {
+    } else if (QSet<QString>{"avc1","avc3","hvc1","hev1","mp4v","av01"}.contains(box.type) && payload + 28 <= end) {
         field(box.fields, "data_reference_index", be16(data, payload + 6), "u(16)");
         field(box.fields, "width", be16(data, payload + 24), "u(16)");
         field(box.fields, "height", be16(data, payload + 26), "u(16)");
@@ -157,6 +241,27 @@ void addBoxFields(Mp4BoxInfo &box, const QByteArray &data) {
         field(box.fields, "general_level_idc", quint8(data.at(payload + 12)), "u(8)");
         field(box.fields, "nal_length_size", (quint8(data.at(payload + 21)) & 3) + 1, "u(2)+1");
         field(box.fields, "numOfArrays", quint8(data.at(payload + 22)), "u(8)");
+    } else if (box.type == "av1C" && payload + 4 <= end) {
+        const quint8 byte0 = quint8(data.at(payload));
+        const quint8 byte1 = quint8(data.at(payload + 1));
+        const quint8 byte2 = quint8(data.at(payload + 2));
+        const quint8 byte3 = quint8(data.at(payload + 3));
+        field(box.fields, "marker", (byte0 >> 7) & 1, "u(1)");
+        field(box.fields, "version", byte0 & 0x7f, "u(7)");
+        field(box.fields, "seq_profile", (byte1 >> 5) & 0x07, "u(3)");
+        field(box.fields, "seq_level_idx_0", byte1 & 0x1f, "u(5)");
+        field(box.fields, "seq_tier_0", (byte2 >> 7) & 1, "u(1)");
+        field(box.fields, "high_bitdepth", (byte2 >> 6) & 1, "u(1)");
+        field(box.fields, "twelve_bit", (byte2 >> 5) & 1, "u(1)");
+        field(box.fields, "monochrome", (byte2 >> 4) & 1, "u(1)");
+        field(box.fields, "chroma_subsampling_x", (byte2 >> 3) & 1, "u(1)");
+        field(box.fields, "chroma_subsampling_y", (byte2 >> 2) & 1, "u(1)");
+        field(box.fields, "chroma_sample_position", byte2 & 0x03, "u(2)");
+        const bool delayPresent = (byte3 & 0x10) != 0;
+        field(box.fields, "initial_presentation_delay_present", delayPresent, "u(1)");
+        if (delayPresent)
+            field(box.fields, "initial_presentation_delay_minus_one", byte3 & 0x0f, "u(4)");
+        field(box.fields, "configOBUs_size", end - payload - 4, "bytes");
     } else if (box.type == "esds" && payload + 4 <= end) {
         field(box.fields, "version", quint8(data.at(payload)), "u(8)");
         for (qint64 pos = payload + 4; pos + 15 < end; ++pos) {
@@ -206,7 +311,7 @@ QVector<Mp4BoxInfo> parseBoxRange(const QByteArray &data, qint64 begin, qint64 e
             qint64 childStart = pos + headerSize;
             if (type == "meta") childStart += 4;
             else if (type == "stsd") childStart += 8;
-            else if (QSet<QString>{"avc1","avc3","hvc1","hev1","mp4v","encv"}.contains(type)) childStart += 78;
+            else if (QSet<QString>{"avc1","avc3","hvc1","hev1","mp4v","av01","encv"}.contains(type)) childStart += 78;
             else if (type == "mp4a" || type == "enca") childStart += 28;
             if (childStart < pos + qint64(size)) box.children = parseBoxRange(data, childStart, pos + qint64(size), depth + 1);
         }
@@ -256,17 +361,19 @@ Mp4DemuxResult demuxMp4Video(const QByteArray &data, const QVector<Mp4BoxInfo> &
         const auto *candidateStbl = pathChild(&trak, {"mdia","minf","stbl"});
         const auto *stsd = directChild(candidateStbl, "stsd");
         if (!hdlr || !candidateStbl || !stsd || fourcc(data, hdlr->offset + hdlr->headerSize + 8) != "vide") continue;
-        for (const auto &entry : stsd->children) if (QSet<QString>{"avc1","avc3","hvc1","hev1","mp4v"}.contains(entry.type)) { selectedTrak=&trak;sampleEntry=&entry;stbl=candidateStbl;break; }
+        for (const auto &entry : stsd->children) if (QSet<QString>{"avc1","avc3","hvc1","hev1","mp4v","av01"}.contains(entry.type)) { selectedTrak=&trak;sampleEntry=&entry;stbl=candidateStbl;break; }
         if (selectedTrak) break;
     }
-    if (!selectedTrak || !sampleEntry || !stbl) throw std::runtime_error("No supported H.264/H.265/MPEG-4 Part 2 video track in MP4");
+    if (!selectedTrak || !sampleEntry || !stbl) throw std::runtime_error("No supported H.264/H.265/MPEG-4 Part 2/AV1 video track in MP4");
 
     Mp4DemuxResult result; result.sampleEntry = sampleEntry->type;
     result.codec = sampleEntry->type.startsWith("avc") ? Codec::Avc
-        : (sampleEntry->type == QStringLiteral("mp4v") ? Codec::Mpeg4Visual : Codec::Hevc);
+        : (sampleEntry->type == QStringLiteral("mp4v") ? Codec::Mpeg4Visual
+        : (sampleEntry->type == QStringLiteral("av01") ? Codec::Av1 : Codec::Hevc));
     const Mp4BoxInfo *config = directChild(sampleEntry,
         result.codec == Codec::Avc ? QStringLiteral("avcC")
-        : (result.codec == Codec::Hevc ? QStringLiteral("hvcC") : QStringLiteral("esds")));
+        : (result.codec == Codec::Hevc ? QStringLiteral("hvcC")
+        : (result.codec == Codec::Mpeg4Visual ? QStringLiteral("esds") : QStringLiteral("av1C"))));
     if (!config) throw std::runtime_error("MP4 video decoder configuration box is missing");
     const qint64 configPayload = config->offset + config->headerSize; const qint64 configEnd = config->offset + config->size;
     int nalLengthSize = 4;
@@ -280,7 +387,7 @@ Mp4DemuxResult demuxMp4Video(const QByteArray &data, const QVector<Mp4BoxInfo> &
         if (configPayload + 23 > configEnd) throw std::runtime_error("Invalid hvcC box");
         nalLengthSize = (quint8(data.at(configPayload + 21)) & 3) + 1; qint64 pos = configPayload + 23; const int arrays = quint8(data.at(configPayload + 22));
         for(int a=0;a<arrays&&pos+3<=configEnd;++a){pos++;const int count=be16(data,pos);pos+=2;for(int i=0;i<count&&pos+2<=configEnd;++i){const int length=be16(data,pos);pos+=2;if(pos+length>configEnd)break;result.units.push_back({pos,2,data.mid(pos,length),true,-1});pos+=length;}}
-    } else {
+    } else if (result.codec == Codec::Mpeg4Visual) {
         const auto [elementaryStart, elementaryLength] =
             mpeg4DecoderSpecificInfo(data, configPayload + 4, configEnd);
         if (elementaryStart < 0)
@@ -291,6 +398,14 @@ Mp4DemuxResult demuxMp4Video(const QByteArray &data, const QVector<Mp4BoxInfo> &
             unit.sampleIndex = -1;
             result.units.push_back(std::move(unit));
         }
+    } else {
+        if (configPayload + 4 > configEnd)
+            throw std::runtime_error("Invalid av1C box");
+        auto configUnits = splitAv1Obus(data.mid(configPayload + 4,
+                                                  configEnd - configPayload - 4),
+                                         configPayload + 4, -1);
+        for (auto &unit : configUnits)
+            result.units.push_back(std::move(unit));
     }
 
     const auto *stsz = directChild(stbl,"stsz"); const auto *stsc = directChild(stbl,"stsc"); const auto *stco = directChild(stbl,"stco"); const auto *co64 = directChild(stbl,"co64");
@@ -314,6 +429,11 @@ Mp4DemuxResult demuxMp4Video(const QByteArray &data, const QVector<Mp4BoxInfo> &
         if(result.codec==Codec::Mpeg4Visual){
             auto sampleUnits=splitUnits(data.mid(sampleOffset,sampleSize));
             for(auto &unit:sampleUnits){unit.offset+=sampleOffset;unit.sampleIndex=i;result.units.push_back(std::move(unit));}
+            continue;
+        }
+        if(result.codec==Codec::Av1){
+            auto sampleUnits=splitAv1Obus(data.mid(sampleOffset,sampleSize),sampleOffset,i);
+            for(auto &unit:sampleUnits)result.units.push_back(std::move(unit));
             continue;
         }
         qint64 pos=sampleOffset;const qint64 end=pos+sampleSize;
@@ -374,6 +494,364 @@ QString mpeg4ProfileName(int indication) {
     return QStringLiteral("profile_and_level_indication %1").arg(hex);
 }
 
+QString av1Name(int type) {
+    static const QMap<int, QString> names{
+        {0, "Reserved OBU"}, {1, "Sequence Header OBU"},
+        {2, "Temporal Delimiter OBU"}, {3, "Frame Header OBU"},
+        {4, "Tile Group OBU"}, {5, "Metadata OBU"}, {6, "Frame OBU"},
+        {7, "Redundant Frame Header OBU"}, {8, "Tile List OBU"},
+        {15, "Padding OBU"}
+    };
+    return names.value(type, QStringLiteral("Reserved OBU type %1").arg(type));
+}
+
+QString av1ProfileName(int profile, int level) {
+    static const QStringList profiles{QStringLiteral("Main Profile"),
+                                      QStringLiteral("High Profile"),
+                                      QStringLiteral("Professional Profile")};
+    QString levelName = QStringLiteral("level_idx %1").arg(level);
+    if (level >= 0 && level <= 23)
+        levelName = QStringLiteral("Level %1.%2").arg(2 + level / 4).arg(level % 4);
+    return QStringLiteral("%1 · %2")
+        .arg(profiles.value(profile, QStringLiteral("Profile %1").arg(profile)), levelName);
+}
+
+QString av1MetadataName(quint64 type) {
+    static const QMap<quint64, QString> names{
+        {1, "HDR Content Light Level"}, {2, "HDR Mastering Display Colour Volume"},
+        {3, "Scalability"}, {4, "ITU-T T.35"}, {5, "Timecode"}
+    };
+    if (type >= 6 && type <= 31)
+        return QStringLiteral("Unregistered private metadata %1").arg(type);
+    return names.value(type, QStringLiteral("Metadata type %1").arg(type));
+}
+
+ParameterSetInfo parseAv1SequenceHeader(const QByteArray &obu) {
+    ParameterSetInfo sequence;
+    sequence.id = 0;
+    BitReader br(av1ObuPayload(obu));
+    sequence.profile = int(br.readBits(3));
+    field(sequence.fields, "seq_profile", sequence.profile, "f(3)");
+    const bool stillPicture = br.flag();
+    field(sequence.fields, "still_picture", stillPicture, "f(1)");
+    sequence.reducedStillPictureHeader = br.flag();
+    field(sequence.fields, "reduced_still_picture_header",
+          sequence.reducedStillPictureHeader, "f(1)");
+
+    bool timingInfoPresent = false;
+    bool initialDisplayDelayPresent = false;
+    int bufferDelayLength = 0;
+    int operatingPoints = 1;
+    if (sequence.reducedStillPictureHeader) {
+        sequence.level = int(br.readBits(5));
+        field(sequence.fields, "seq_level_idx[0]", sequence.level, "f(5)");
+    } else {
+        timingInfoPresent = br.flag();
+        field(sequence.fields, "timing_info_present_flag", timingInfoPresent, "f(1)");
+        if (timingInfoPresent) {
+            const quint32 displayTick = br.readBits(32);
+            const quint32 timeScale = br.readBits(32);
+            field(sequence.fields, "num_units_in_display_tick", displayTick, "f(32)");
+            field(sequence.fields, "time_scale", timeScale, "f(32)");
+            const bool equalInterval = br.flag();
+            field(sequence.fields, "equal_picture_interval", equalInterval, "f(1)");
+            if (equalInterval) {
+                const quint32 ticksMinusOne = br.ue();
+                field(sequence.fields, "num_ticks_per_picture_minus_1", ticksMinusOne, "uvlc()");
+                if (displayTick && ticksMinusOne < 1000000)
+                    sequence.fps = double(timeScale) /
+                        (double(displayTick) * (ticksMinusOne + 1.0));
+            }
+            sequence.decoderModelInfoPresent = br.flag();
+            field(sequence.fields, "decoder_model_info_present_flag",
+                  sequence.decoderModelInfoPresent, "f(1)");
+            if (sequence.decoderModelInfoPresent) {
+                bufferDelayLength = int(br.readBits(5)) + 1;
+                field(sequence.fields, "buffer_delay_length_minus_1",
+                      bufferDelayLength - 1, "f(5)");
+                field(sequence.fields, "num_units_in_decoding_tick", br.readBits(32), "f(32)");
+                field(sequence.fields, "buffer_removal_time_length_minus_1", br.readBits(5), "f(5)");
+                field(sequence.fields, "frame_presentation_time_length_minus_1", br.readBits(5), "f(5)");
+            }
+        }
+        initialDisplayDelayPresent = br.flag();
+        field(sequence.fields, "initial_display_delay_present_flag",
+              initialDisplayDelayPresent, "f(1)");
+        operatingPoints = int(br.readBits(5)) + 1;
+        field(sequence.fields, "operating_points_cnt_minus_1", operatingPoints - 1, "f(5)");
+        for (int op = 0; op < operatingPoints; ++op) {
+            const int operatingPointIdc = int(br.readBits(12));
+            const int level = int(br.readBits(5));
+            field(sequence.fields, QStringLiteral("operating_point_idc[%1]").arg(op),
+                  operatingPointIdc, "f(12)");
+            field(sequence.fields, QStringLiteral("seq_level_idx[%1]").arg(op),
+                  level, "f(5)");
+            if (op == 0) sequence.level = level;
+            if (level > 7)
+                field(sequence.fields, QStringLiteral("seq_tier[%1]").arg(op), br.flag(), "f(1)");
+            if (sequence.decoderModelInfoPresent) {
+                const bool present = br.flag();
+                field(sequence.fields,
+                      QStringLiteral("decoder_model_present_for_this_op[%1]").arg(op),
+                      present, "f(1)");
+                if (present) {
+                    field(sequence.fields, QStringLiteral("decoder_buffer_delay[%1]").arg(op),
+                          br.readBits(bufferDelayLength), QStringLiteral("f(%1)").arg(bufferDelayLength));
+                    field(sequence.fields, QStringLiteral("encoder_buffer_delay[%1]").arg(op),
+                          br.readBits(bufferDelayLength), QStringLiteral("f(%1)").arg(bufferDelayLength));
+                    field(sequence.fields, QStringLiteral("low_delay_mode_flag[%1]").arg(op),
+                          br.flag(), "f(1)");
+                }
+            }
+            if (initialDisplayDelayPresent) {
+                const bool present = br.flag();
+                field(sequence.fields,
+                      QStringLiteral("initial_display_delay_present_for_this_op[%1]").arg(op),
+                      present, "f(1)");
+                if (present)
+                    field(sequence.fields,
+                          QStringLiteral("initial_display_delay_minus_1[%1]").arg(op),
+                          br.readBits(4), "f(4)");
+            }
+        }
+    }
+
+    sequence.frameWidthBits = int(br.readBits(4)) + 1;
+    sequence.frameHeightBits = int(br.readBits(4)) + 1;
+    field(sequence.fields, "frame_width_bits_minus_1", sequence.frameWidthBits - 1, "f(4)");
+    field(sequence.fields, "frame_height_bits_minus_1", sequence.frameHeightBits - 1, "f(4)");
+    sequence.width = int(br.readBits(sequence.frameWidthBits)) + 1;
+    sequence.height = int(br.readBits(sequence.frameHeightBits)) + 1;
+    field(sequence.fields, "max_frame_width_minus_1", sequence.width - 1,
+          QStringLiteral("f(%1)").arg(sequence.frameWidthBits));
+    field(sequence.fields, "max_frame_height_minus_1", sequence.height - 1,
+          QStringLiteral("f(%1)").arg(sequence.frameHeightBits));
+
+    if (!sequence.reducedStillPictureHeader) {
+        sequence.frameIdNumbersPresent = br.flag();
+        field(sequence.fields, "frame_id_numbers_present_flag",
+              sequence.frameIdNumbersPresent, "f(1)");
+        if (sequence.frameIdNumbersPresent) {
+            sequence.deltaFrameIdLength = int(br.readBits(4)) + 2;
+            sequence.additionalFrameIdLength = int(br.readBits(3)) + 1;
+            field(sequence.fields, "delta_frame_id_length_minus_2",
+                  sequence.deltaFrameIdLength - 2, "f(4)");
+            field(sequence.fields, "additional_frame_id_length_minus_1",
+                  sequence.additionalFrameIdLength - 1, "f(3)");
+        }
+    }
+    sequence.use128x128Superblock = br.flag();
+    sequence.ctbSize = sequence.use128x128Superblock ? 128 : 64;
+    sequence.minCodingBlockSize = 4;
+    field(sequence.fields, "use_128x128_superblock",
+          sequence.use128x128Superblock, "f(1)");
+    field(sequence.fields, "enable_filter_intra", br.flag(), "f(1)");
+    field(sequence.fields, "enable_intra_edge_filter", br.flag(), "f(1)");
+    if (!sequence.reducedStillPictureHeader) {
+        field(sequence.fields, "enable_interintra_compound", br.flag(), "f(1)");
+        field(sequence.fields, "enable_masked_compound", br.flag(), "f(1)");
+        field(sequence.fields, "enable_warped_motion", br.flag(), "f(1)");
+        field(sequence.fields, "enable_dual_filter", br.flag(), "f(1)");
+        sequence.enableOrderHint = br.flag();
+        field(sequence.fields, "enable_order_hint", sequence.enableOrderHint, "f(1)");
+        if (sequence.enableOrderHint) {
+            field(sequence.fields, "enable_jnt_comp", br.flag(), "f(1)");
+            field(sequence.fields, "enable_ref_frame_mvs", br.flag(), "f(1)");
+        }
+        const bool chooseScreenTools = br.flag();
+        field(sequence.fields, "seq_choose_screen_content_tools", chooseScreenTools, "f(1)");
+        sequence.forceScreenContentTools = chooseScreenTools ? 2 : int(br.flag());
+        if (!chooseScreenTools)
+            field(sequence.fields, "seq_force_screen_content_tools",
+                  sequence.forceScreenContentTools, "f(1)");
+        if (sequence.forceScreenContentTools > 0) {
+            const bool chooseIntegerMv = br.flag();
+            field(sequence.fields, "seq_choose_integer_mv", chooseIntegerMv, "f(1)");
+            sequence.forceIntegerMv = chooseIntegerMv ? 2 : int(br.flag());
+            if (!chooseIntegerMv)
+                field(sequence.fields, "seq_force_integer_mv", sequence.forceIntegerMv, "f(1)");
+        }
+        if (sequence.enableOrderHint) {
+            sequence.orderHintBits = int(br.readBits(3)) + 1;
+            field(sequence.fields, "order_hint_bits_minus_1",
+                  sequence.orderHintBits - 1, "f(3)");
+        }
+    }
+    sequence.enableSuperres = br.flag();
+    sequence.enableCdef = br.flag();
+    sequence.enableRestoration = br.flag();
+    field(sequence.fields, "enable_superres", sequence.enableSuperres, "f(1)");
+    field(sequence.fields, "enable_cdef", sequence.enableCdef, "f(1)");
+    field(sequence.fields, "enable_restoration", sequence.enableRestoration, "f(1)");
+
+    const bool highBitdepth = br.flag();
+    bool twelveBit = false;
+    if (sequence.profile == 2 && highBitdepth) twelveBit = br.flag();
+    sequence.bitDepth = twelveBit ? 12 : (highBitdepth ? 10 : 8);
+    field(sequence.fields, "high_bitdepth", highBitdepth, "f(1)");
+    if (sequence.profile == 2 && highBitdepth)
+        field(sequence.fields, "twelve_bit", twelveBit, "f(1)");
+    const bool monochrome = sequence.profile == 1 ? false : br.flag();
+    field(sequence.fields, "mono_chrome", monochrome, sequence.profile == 1 ? "derived" : "f(1)");
+    const bool colorDescription = br.flag();
+    field(sequence.fields, "color_description_present_flag", colorDescription, "f(1)");
+    int primaries = 2, transfer = 2, matrix = 2;
+    if (colorDescription) {
+        primaries = int(br.readBits(8)); transfer = int(br.readBits(8)); matrix = int(br.readBits(8));
+        field(sequence.fields, "color_primaries", primaries, "f(8)");
+        field(sequence.fields, "transfer_characteristics", transfer, "f(8)");
+        field(sequence.fields, "matrix_coefficients", matrix, "f(8)");
+    }
+    int subsamplingX = 1, subsamplingY = 1;
+    if (monochrome) {
+        field(sequence.fields, "color_range", br.flag(), "f(1)");
+        sequence.chroma = 0;
+    } else if (primaries == 1 && transfer == 13 && matrix == 0) {
+        sequence.chroma = 3;
+        subsamplingX = subsamplingY = 0;
+        field(sequence.fields, "color_range", 1, "derived");
+    } else {
+        field(sequence.fields, "color_range", br.flag(), "f(1)");
+        if (sequence.profile == 0) { subsamplingX = 1; subsamplingY = 1; }
+        else if (sequence.profile == 1) { subsamplingX = 0; subsamplingY = 0; }
+        else if (sequence.bitDepth == 12) {
+            subsamplingX = int(br.flag());
+            subsamplingY = subsamplingX ? int(br.flag()) : 0;
+        } else { subsamplingX = 1; subsamplingY = 0; }
+        sequence.chroma = subsamplingX ? (subsamplingY ? 1 : 2) : 3;
+        if (subsamplingX && subsamplingY)
+            field(sequence.fields, "chroma_sample_position", br.readBits(2), "f(2)");
+    }
+    field(sequence.fields, "chroma_subsampling_x", subsamplingX, "derived");
+    field(sequence.fields, "chroma_subsampling_y", subsamplingY, "derived");
+    if (monochrome)
+        field(sequence.fields, "separate_uv_delta_q", 0, "derived");
+    else
+        field(sequence.fields, "separate_uv_delta_q", br.flag(), "f(1)");
+    sequence.filmGrainParamsPresent = br.flag();
+    field(sequence.fields, "film_grain_params_present",
+          sequence.filmGrainParamsPresent, "f(1)");
+    field(sequence.fields, "calculated_width", sequence.width, "pixels");
+    field(sequence.fields, "calculated_height", sequence.height, "pixels");
+    field(sequence.fields, "calculated_bit_depth", sequence.bitDepth, "bits");
+    return sequence;
+}
+
+SliceInfo parseAv1FrameHeader(const QByteArray &obu, const ParameterSetInfo &sequence) {
+    SliceInfo frame;
+    frame.firstSlice = true;
+    frame.firstMb = 0;
+    BitReader br(av1ObuPayload(obu));
+    static const QStringList frameTypes{QStringLiteral("KEY"), QStringLiteral("INTER"),
+                                        QStringLiteral("INTRA_ONLY"), QStringLiteral("SWITCH")};
+    if (sequence.reducedStillPictureHeader) {
+        frame.rawType = 0;
+        frame.type = QStringLiteral("KEY");
+        frame.showFrame = true;
+        frame.refreshFrameFlags = 0xff;
+        field(frame.fields, "frame_type", QStringLiteral("0 (KEY)"), "derived");
+        field(frame.fields, "show_frame", true, "derived");
+        field(frame.fields, "refresh_frame_flags", QStringLiteral("0xFF"), "derived");
+        return frame;
+    }
+    frame.showExistingFrame = br.flag();
+    field(frame.fields, "show_existing_frame", frame.showExistingFrame, "f(1)");
+    if (frame.showExistingFrame) {
+        frame.frameToShowMapIndex = int(br.readBits(3));
+        frame.type = QStringLiteral("SHOW_EXISTING");
+        frame.showFrame = true;
+        frame.referenceSlots.push_back(frame.frameToShowMapIndex);
+        field(frame.fields, "frame_to_show_map_idx", frame.frameToShowMapIndex, "f(3)");
+        return frame;
+    }
+    frame.rawType = int(br.readBits(2));
+    frame.type = frameTypes.value(frame.rawType, QStringLiteral("?"));
+    field(frame.fields, "frame_type",
+          QStringLiteral("%1 (%2)").arg(frame.rawType).arg(frame.type), "f(2)");
+    frame.showFrame = br.flag();
+    field(frame.fields, "show_frame", frame.showFrame, "f(1)");
+    if (!frame.showFrame)
+        field(frame.fields, "showable_frame", br.flag(), "f(1)");
+    const bool frameIsIntra = frame.rawType == 0 || frame.rawType == 2;
+    bool errorResilient = false;
+    if (frame.rawType == 3 || (frame.rawType == 0 && frame.showFrame))
+        errorResilient = true;
+    else
+        errorResilient = br.flag();
+    field(frame.fields, "error_resilient_mode", errorResilient,
+          (frame.rawType == 3 || (frame.rawType == 0 && frame.showFrame)) ? "derived" : "f(1)");
+    field(frame.fields, "disable_cdf_update", br.flag(), "f(1)");
+    int allowScreenTools = sequence.forceScreenContentTools;
+    if (allowScreenTools == 2) allowScreenTools = int(br.flag());
+    field(frame.fields, "allow_screen_content_tools", allowScreenTools,
+          sequence.forceScreenContentTools == 2 ? "f(1)" : "derived");
+    int forceIntegerMv = 0;
+    if (allowScreenTools) {
+        if (frame.rawType == 3) forceIntegerMv = 1;
+        else if (sequence.forceIntegerMv == 2) forceIntegerMv = int(br.flag());
+        else forceIntegerMv = sequence.forceIntegerMv;
+    }
+    field(frame.fields, "force_integer_mv", forceIntegerMv,
+          allowScreenTools && frame.rawType != 3 && sequence.forceIntegerMv == 2 ? "f(1)" : "derived");
+    if (sequence.frameIdNumbersPresent) {
+        const int bits = sequence.additionalFrameIdLength + sequence.deltaFrameIdLength;
+        field(frame.fields, "current_frame_id", br.readBits(bits),
+              QStringLiteral("f(%1)").arg(bits));
+    }
+    const bool sizeOverride = frame.rawType == 3 ? true : br.flag();
+    field(frame.fields, "frame_size_override_flag", sizeOverride,
+          frame.rawType == 3 ? "derived" : "f(1)");
+    if (sequence.enableOrderHint) {
+        frame.poc = int(br.readBits(sequence.orderHintBits));
+        field(frame.fields, "order_hint", frame.poc,
+              QStringLiteral("f(%1)").arg(sequence.orderHintBits));
+    }
+    if (!(frameIsIntra || errorResilient))
+        field(frame.fields, "primary_ref_frame", br.readBits(3), "f(3)");
+    if (sequence.decoderModelInfoPresent) {
+        field(frame.fields, "remaining_header",
+              QStringLiteral("decoder model timing present; advanced fields deferred"),
+              "payload");
+        return frame;
+    }
+    if (frame.rawType == 3 || (frame.rawType == 0 && frame.showFrame))
+        frame.refreshFrameFlags = 0xff;
+    else
+        frame.refreshFrameFlags = int(br.readBits(8));
+    field(frame.fields, "refresh_frame_flags",
+          QStringLiteral("0x%1").arg(frame.refreshFrameFlags, 2, 16, QChar('0')).toUpper(),
+          frame.refreshFrameFlags == 0xff && (frame.rawType == 3 || frame.rawType == 0)
+              ? "derived" : "f(8)");
+    if (!frameIsIntra) {
+        bool shortSignaling = false;
+        if (sequence.enableOrderHint) {
+            shortSignaling = br.flag();
+            field(frame.fields, "frame_refs_short_signaling", shortSignaling, "f(1)");
+        }
+        if (shortSignaling) {
+            const int last = int(br.readBits(3));
+            const int golden = int(br.readBits(3));
+            frame.referenceSlots << last << golden;
+            field(frame.fields, "last_frame_idx", last, "f(3)");
+            field(frame.fields, "gold_frame_idx", golden, "f(3)");
+        } else {
+            for (int reference = 0; reference < 7; ++reference) {
+                const int slot = int(br.readBits(3));
+                if (!frame.referenceSlots.contains(slot)) frame.referenceSlots.push_back(slot);
+                field(frame.fields, QStringLiteral("ref_frame_idx[%1]").arg(reference),
+                      slot, "f(3)");
+                if (sequence.frameIdNumbersPresent) {
+                    field(frame.fields,
+                          QStringLiteral("delta_frame_id_minus_1[%1]").arg(reference),
+                          br.readBits(sequence.deltaFrameIdLength),
+                          QStringLiteral("f(%1)").arg(sequence.deltaFrameIdLength));
+                }
+            }
+        }
+    }
+    return frame;
+}
+
 QString seiName(int type) {
     static const QMap<int, QString> names{{0,"Buffering Period"},{1,"Picture Timing"},{2,"Pan-Scan Rectangle"},
         {3,"Filler Payload"},{4,"User Data Registered (ITU-T T.35)"},{5,"User Data Unregistered"},{6,"Recovery Point"},
@@ -422,21 +900,122 @@ QVector<RawUnit> splitUnits(const QByteArray &bytes) {
     return out;
 }
 
+QVector<RawUnit> splitAv1Obus(const QByteArray &bytes, qint64 baseOffset,
+                              int sampleIndex) {
+    QVector<RawUnit> out;
+    int position = 0;
+    while (position < bytes.size()) {
+        const int begin = position;
+        const quint8 header = quint8(bytes.at(position++));
+        if ((header & 0x80) != 0 || (header & 0x01) != 0)
+            break;
+        const bool extension = (header & 0x04) != 0;
+        const bool hasSize = (header & 0x02) != 0;
+        if (extension) {
+            if (position >= bytes.size()) break;
+            ++position;
+        }
+        quint64 payloadSize = 0;
+        if (hasSize) {
+            if (!readLeb128(bytes, position, bytes.size(), payloadSize)
+                || payloadSize > quint64(bytes.size() - position))
+                break;
+        } else {
+            // Low-overhead OBU streams need a size field when multiple OBUs are
+            // concatenated. A size-less OBU can only consume the remaining bytes.
+            payloadSize = quint64(bytes.size() - position);
+        }
+        const qint64 total = qint64(position - begin) + qint64(payloadSize);
+        if (total <= 0 || begin + total > bytes.size()) break;
+        out.push_back({baseOffset + begin, 0, bytes.mid(begin, int(total)), false,
+                       sampleIndex});
+        position = begin + int(total);
+        if (!hasSize) break;
+    }
+    return out;
+}
+
+QVector<RawUnit> splitIvfAv1(const QByteArray &bytes, double &fps,
+                             double &duration) {
+    QVector<RawUnit> out;
+    if (bytes.size() < 32 || bytes.left(4) != QByteArrayLiteral("DKIF")
+        || bytes.mid(8, 4) != QByteArrayLiteral("AV01"))
+        return out;
+    const int headerSize = std::max(32, int(le16(bytes, 6)));
+    const quint32 rate = le32(bytes, 16);
+    const quint32 scale = le32(bytes, 20);
+    const quint32 declaredFrames = le32(bytes, 24);
+    fps = rate && scale ? double(rate) / scale : 0.0;
+    QVector<quint64> timestamps;
+    int position = headerSize;
+    int frameIndex = 0;
+    while (position + 12 <= bytes.size()) {
+        const quint32 frameSize = le32(bytes, position);
+        const quint64 timestamp = le64(bytes, position + 4);
+        timestamps.push_back(timestamp);
+        const int payload = position + 12;
+        if (frameSize == 0 || quint64(payload) + frameSize > quint64(bytes.size())) break;
+        auto frameUnits = splitAv1Obus(bytes.mid(payload, int(frameSize)), payload,
+                                        frameIndex);
+        for (auto &unit : frameUnits) out.push_back(std::move(unit));
+        position = payload + int(frameSize);
+        ++frameIndex;
+    }
+    const int frames = declaredFrames > 0 ? int(declaredFrames) : frameIndex;
+    quint64 timestampStep = 1;
+    QVector<quint64> steps;
+    for (int i = 1; i < timestamps.size(); ++i)
+        if (timestamps.at(i) > timestamps.at(i - 1))
+            steps.push_back(timestamps.at(i) - timestamps.at(i - 1));
+    if (!steps.isEmpty()) {
+        std::sort(steps.begin(), steps.end());
+        timestampStep = steps.at(steps.size() / 2);
+        if (rate && scale)
+            fps = double(rate) / (double(scale) * timestampStep);
+    }
+    if (rate && scale && !timestamps.isEmpty())
+        duration = double(timestamps.last() - timestamps.first() + timestampStep)
+            * scale / rate;
+    else
+        duration = fps > 0 ? frames / fps : 0.0;
+    return out;
+}
+
+bool looksLikeAv1ObuStream(const QByteArray &bytes, const QString &path) {
+    if (path.endsWith(QStringLiteral(".obu"), Qt::CaseInsensitive)
+        || path.endsWith(QStringLiteral(".av1"), Qt::CaseInsensitive))
+        return true;
+    const auto units = splitAv1Obus(bytes.left(int(std::min<qsizetype>(bytes.size(), 1024 * 1024))));
+    if (units.isEmpty()) return false;
+    bool sequenceHeader = false;
+    for (const auto &unit : units) {
+        if (unit.payload.isEmpty()) continue;
+        const int type = (quint8(unit.payload.at(0)) >> 3) & 0x0f;
+        sequenceHeader |= type == 1;
+    }
+    return sequenceHeader && (units.size() >= 2 || units.first().payload.size() == bytes.size());
+}
+
 Codec detectCodec(const QVector<RawUnit> &units, const QString &path) {
+    if (path.contains(QRegularExpression(QStringLiteral("(av1|\\.obu)"), QRegularExpression::CaseInsensitiveOption))) return Codec::Av1;
     if (path.contains(QRegularExpression(QStringLiteral("(mpeg4|mp4v|\\.m4v)"), QRegularExpression::CaseInsensitiveOption))) return Codec::Mpeg4Visual;
     if (path.contains(QRegularExpression(QStringLiteral("(h265|hevc|\\.265)"), QRegularExpression::CaseInsensitiveOption))) return Codec::Hevc;
     if (path.contains(QRegularExpression(QStringLiteral("(h264|avc|\\.264)"), QRegularExpression::CaseInsensitiveOption))) return Codec::Avc;
-    int avc = 0, hevc = 0, mpeg4 = 0;
+    int avc = 0, hevc = 0, mpeg4 = 0, av1 = 0;
     for (int i = 0; i < std::min(60, int(units.size())); ++i) {
         if (units[i].payload.isEmpty()) continue;
         const int a = quint8(units[i].payload.at(0)) & 31;
         const int h = (quint8(units[i].payload.at(0)) >> 1) & 63;
         const int m = quint8(units[i].payload.at(0));
+        const int o = (quint8(units[i].payload.at(0)) >> 3) & 0x0f;
         if (a > 0 && a <= 23) ++avc;
         if (a == 5 || a == 7 || a == 8) avc += 3;
         if (h == 32 || h == 33 || h == 34 || h == 39 || h == 40) hevc += 4;
         if (m == 0xb0 || m == 0xb3 || m == 0xb5 || m == 0xb6 || (m >= 0x20 && m <= 0x2f)) mpeg4 += 4;
+        if ((m & 0x80) == 0 && (m & 0x01) == 0 && (m & 0x02) != 0
+            && o >= 1 && o <= 8) av1 += o == 1 ? 5 : 1;
     }
+    if (av1 > std::max({avc, hevc, mpeg4})) return Codec::Av1;
     if (mpeg4 > std::max(avc, hevc)) return Codec::Mpeg4Visual;
     return hevc > avc ? Codec::Hevc : Codec::Avc;
 }
@@ -720,29 +1299,34 @@ QVector<SeiMessage> parseSei(const QByteArray &payload, Codec codec) {
 bool isVcl(Codec codec,int type){
     if(codec==Codec::Avc)return type>=1&&type<=5;
     if(codec==Codec::Hevc)return type<=31;
-    return type==0xb6;
+    if(codec==Codec::Mpeg4Visual)return type==0xb6;
+    return type==3||type==6;
 }
 bool isParameter(Codec codec,int type){
     if(codec==Codec::Avc)return type==7||type==8||type==13;
     if(codec==Codec::Hevc)return type==32||type==33||type==34;
-    return type==0xb0||type==0xb5||(type>=0x00&&type<=0x2f);
+    if(codec==Codec::Mpeg4Visual)return type==0xb0||type==0xb5||(type>=0x00&&type<=0x2f);
+    return type==1;
 }
 
 void analyzeFrames(StreamInfo &stream) {
-    QVector<int> dpb;const int maxReferences=std::max(1,stream.sps.value(stream.primarySpsId).maxReferences);const int unitSize=stream.codec==Codec::Hevc?stream.sps.value(stream.primarySpsId).ctbSize:16;
+    QVector<int> dpb;QVector<int> av1Slots(8,-1);const int maxReferences=std::max(1,stream.sps.value(stream.primarySpsId).maxReferences);const int unitSize=(stream.codec==Codec::Hevc||stream.codec==Codec::Av1)?stream.sps.value(stream.primarySpsId).ctbSize:16;
     const int cols=stream.width>0?int(std::ceil(double(stream.width)/unitSize)):0,rows=stream.height>0?int(std::ceil(double(stream.height)/unitSize)):0,total=cols*rows;
     for(auto &frame:stream.frames){
         QSet<QString> types;frame.randomAccess=false;frame.referencePicture=false;if(stream.codec!=Codec::Mpeg4Visual)frame.poc=-1;
-        for(int ni:frame.sliceNalIndices){const auto &nal=stream.nals.at(ni);types.insert(nal.slice.type);if(stream.codec==Codec::Avc){frame.randomAccess|=nal.nalType==5;frame.referencePicture|=nal.refIdc>0;}else if(stream.codec==Codec::Hevc){frame.randomAccess|=nal.nalType>=16&&nal.nalType<=21;frame.referencePicture|=(nal.nalType&1)!=0||nal.nalType>=16;}else{frame.randomAccess|=nal.slice.type==QStringLiteral("I");frame.referencePicture|=nal.slice.type==QStringLiteral("I")||nal.slice.type==QStringLiteral("P")||nal.slice.type==QStringLiteral("S");}if(frame.poc<0)frame.poc=nal.slice.poc;}
-        QStringList typeList(types.begin(),types.end());std::sort(typeList.begin(),typeList.end());frame.displayType=frame.randomAccess?(stream.codec==Codec::Avc?"IDR":(stream.codec==Codec::Hevc?"IRAP":"I")):typeList.join('/');if(frame.displayType.isEmpty())frame.displayType=frame.type;
-        frame.truncatedStart=stream.codec==Codec::Mpeg4Visual?false:(!frame.sliceNalIndices.isEmpty()&&(stream.codec==Codec::Avc?stream.nals.at(frame.sliceNalIndices.first()).slice.firstMb!=0:!stream.nals.at(frame.sliceNalIndices.first()).slice.firstSlice));
-        frame.structure=stream.codec==Codec::Mpeg4Visual?QStringLiteral("完整 VOP"):(frame.truncatedStart?QStringLiteral("起始分片缺失"):(frame.sliceNalIndices.size()>1?QStringLiteral("分片帧 ×%1").arg(frame.sliceNalIndices.size()):QStringLiteral("完整帧")));
+        for(int ni:frame.sliceNalIndices){const auto &nal=stream.nals.at(ni);types.insert(nal.slice.type);if(stream.codec==Codec::Avc){frame.randomAccess|=nal.nalType==5;frame.referencePicture|=nal.refIdc>0;}else if(stream.codec==Codec::Hevc){frame.randomAccess|=nal.nalType>=16&&nal.nalType<=21;frame.referencePicture|=(nal.nalType&1)!=0||nal.nalType>=16;}else if(stream.codec==Codec::Mpeg4Visual){frame.randomAccess|=nal.slice.type==QStringLiteral("I");frame.referencePicture|=nal.slice.type==QStringLiteral("I")||nal.slice.type==QStringLiteral("P")||nal.slice.type==QStringLiteral("S");}else{frame.randomAccess|=nal.slice.type==QStringLiteral("KEY")&&nal.slice.showFrame;frame.referencePicture|=nal.slice.refreshFrameFlags!=0;}if(frame.poc<0||stream.codec==Codec::Av1&&nal.slice.showFrame&&nal.slice.poc>=0)frame.poc=nal.slice.poc;}
+        if(stream.codec==Codec::Av1&&frame.type==QStringLiteral("SHOW_EXISTING"))frame.poc=-1;
+        QStringList typeList(types.begin(),types.end());std::sort(typeList.begin(),typeList.end());frame.displayType=frame.randomAccess?(stream.codec==Codec::Avc?"IDR":(stream.codec==Codec::Hevc?"IRAP":(stream.codec==Codec::Av1?"KEY":"I"))):typeList.join('/');if(frame.displayType.isEmpty())frame.displayType=frame.type;
+        frame.truncatedStart=(stream.codec==Codec::Mpeg4Visual||stream.codec==Codec::Av1)?false:(!frame.sliceNalIndices.isEmpty()&&(stream.codec==Codec::Avc?stream.nals.at(frame.sliceNalIndices.first()).slice.firstMb!=0:!stream.nals.at(frame.sliceNalIndices.first()).slice.firstSlice));
+        frame.structure=stream.codec==Codec::Mpeg4Visual?QStringLiteral("完整 VOP"):(stream.codec==Codec::Av1?(std::any_of(frame.sliceNalIndices.begin(),frame.sliceNalIndices.end(),[&stream](int index){return stream.nals.at(index).nalType==6;})?QStringLiteral("Frame OBU"):QStringLiteral("Frame Header + Tile Group")):(frame.truncatedStart?QStringLiteral("起始分片缺失"):(frame.sliceNalIndices.size()>1?QStringLiteral("分片帧 ×%1").arg(frame.sliceNalIndices.size()):QStringLiteral("完整帧"))));
         for(int ni:frame.nalIndices)for(const auto &sei:stream.nals.at(ni).sei)if(sei.type==6){frame.recoveryPoint=true;frame.recoveryFrameCount=sei.recoveryFrameCount;}
         const bool idr=std::any_of(frame.sliceNalIndices.begin(),frame.sliceNalIndices.end(),[&stream](int index){const auto &unit=stream.nals.at(index);return stream.codec==Codec::Avc?unit.nalType==5:(stream.codec==Codec::Hevc&&(unit.nalType==19||unit.nalType==20));});
         if(idr)dpb.clear();
         int l0=0,l1=0;for(int ni:frame.sliceNalIndices){const auto &slice=stream.nals.at(ni).slice;l0=std::max(l0,slice.numRefL0);l1=std::max(l1,slice.numRefL1);}
-        auto appendReference=[&frame](int index){if(index>=0&&!frame.references.contains(index))frame.references.push_back(index);};
-        if(types.contains("B")){
+        auto appendReference=[&frame](int index){if(index>=0&&index!=frame.index&&!frame.references.contains(index))frame.references.push_back(index);};
+        if(stream.codec==Codec::Av1){
+            for(int ni:frame.sliceNalIndices){const auto &header=stream.nals.at(ni).slice;for(int slot:header.referenceSlots)if(slot>=0&&slot<av1Slots.size())appendReference(av1Slots.at(slot));for(int slot=0;slot<8;++slot)if((header.refreshFrameFlags&(1<<slot))!=0)av1Slots[slot]=frame.index;}
+        }else if(types.contains("B")){
             QVector<int> lower,higher;for(int ref:dpb){const int refPoc=stream.frames.at(ref).poc;if(frame.poc>=0&&refPoc>=0&&(refPoc>frame.poc))higher.push_back(ref);else lower.push_back(ref);}
             if(stream.codec==Codec::Mpeg4Visual){lower.clear();higher.clear();for(int ref:dpb){if(stream.frames.at(ref).pts>frame.pts+0.000001)higher.push_back(ref);else lower.push_back(ref);}if(higher.isEmpty()&&dpb.size()>=2){lower={dpb.at(dpb.size()-2)};higher={dpb.last()};}}
             std::sort(lower.begin(),lower.end(),[&stream](int a,int b){return stream.frames.at(a).poc>stream.frames.at(b).poc;});
@@ -751,7 +1335,7 @@ void analyzeFrames(StreamInfo &stream) {
         }else if(types.contains("P")||types.contains("SP")){
             for(int i=int(dpb.size())-1,count=0;i>=0&&count<l0;--i,++count)appendReference(dpb.at(i));
         }
-        if(frame.referencePicture){dpb.push_back(frame.index);while(dpb.size()>maxReferences)dpb.removeFirst();}
+        if(stream.codec!=Codec::Av1&&frame.referencePicture){dpb.push_back(frame.index);while(dpb.size()>maxReferences)dpb.removeFirst();}
         frame.unitSize=unitSize;frame.unitColumns=cols;frame.unitRows=rows;
         QVector<QPair<int,int>> starts;for(int i=0;i<frame.sliceNalIndices.size();++i){const auto &s=stream.nals.at(frame.sliceNalIndices[i]).slice;starts.push_back({stream.codec==Codec::Hevc?s.address:s.firstMb,i});}
         std::sort(starts.begin(),starts.end());for(int i=0;i<starts.size();++i){const int start=std::clamp(starts[i].first,0,total),end=std::clamp(i+1<starts.size()?starts[i+1].first:total,start,total),sliceIndex=starts[i].second;const auto &slice=stream.nals.at(frame.sliceNalIndices[sliceIndex]).slice;frame.regions.push_back({sliceIndex,start,end,slice.type,-1});}
@@ -765,11 +1349,13 @@ StreamPtr BitstreamParser::parseFile(const QString &path) {
     auto stream=std::make_shared<StreamInfo>();stream->filePath=path;stream->fileName=QFileInfo(path).fileName();
     QFile file(path);if(!file.open(QIODevice::ReadOnly)){stream->error=file.errorString();return stream;}stream->bytes=file.readAll();if(stream->bytes.isEmpty()){stream->error=QStringLiteral("文件为空");return stream;}
     try{
-        QVector<RawUnit> raw;Mp4DemuxResult mp4;
+        QVector<RawUnit> raw;Mp4DemuxResult mp4;double elementaryFps=0.0,elementaryDuration=0.0;bool ivfAv1=false;
         if(looksLikeMp4(stream->bytes,path)){
             stream->containerFile=true;stream->boxes=parseBoxRange(stream->bytes,0,stream->bytes.size());mp4=demuxMp4Video(stream->bytes,stream->boxes);raw=mp4.units;stream->codec=mp4.codec;stream->format=QStringLiteral("ISO BMFF / MP4 (%1)").arg(mp4.sampleEntry);
         }else{
-            raw=splitUnits(stream->bytes);stream->codec=detectCodec(raw,QFileInfo(path).fileName());stream->format=stream->codec==Codec::Mpeg4Visual?QStringLiteral("MPEG-4 Visual start-code stream"):(!raw.isEmpty()&&raw.first().lengthPrefixed?QStringLiteral("Length-prefixed"):QStringLiteral("Annex-B"));
+            ivfAv1=stream->bytes.size()>=32&&stream->bytes.left(4)==QByteArrayLiteral("DKIF")&&stream->bytes.mid(8,4)==QByteArrayLiteral("AV01");
+            const bool av1Obu=!ivfAv1&&looksLikeAv1ObuStream(stream->bytes,QFileInfo(path).fileName());
+            raw=ivfAv1?splitIvfAv1(stream->bytes,elementaryFps,elementaryDuration):(av1Obu?splitAv1Obus(stream->bytes):splitUnits(stream->bytes));stream->codec=(ivfAv1||av1Obu)?Codec::Av1:detectCodec(raw,QFileInfo(path).fileName());stream->format=ivfAv1?QStringLiteral("AV1 IVF"):(stream->codec==Codec::Av1?QStringLiteral("AV1 low-overhead OBU stream"):(stream->codec==Codec::Mpeg4Visual?QStringLiteral("MPEG-4 Visual start-code stream"):(!raw.isEmpty()&&raw.first().lengthPrefixed?QStringLiteral("Length-prefixed"):QStringLiteral("Annex-B"))));
         }
         if(raw.isEmpty())throw std::runtime_error("No supported video bitstream units found");
         stream->nals.reserve(raw.size());
@@ -777,10 +1363,10 @@ StreamPtr BitstreamParser::parseFile(const QString &path) {
         for(int i=0;i<raw.size();++i){
             NalUnit nal;nal.index=i;nal.offset=raw[i].offset;nal.startCodeSize=raw[i].startCode;nal.size=raw[i].payload.size()+raw[i].startCode;nal.payload=raw[i].payload;nal.sampleIndex=raw[i].sampleIndex;if(nal.payload.isEmpty())continue;
             const quint8 h0=quint8(nal.payload.at(0));
-            nal.nalType=stream->codec==Codec::Avc?(h0&31):(stream->codec==Codec::Hevc?((h0>>1)&63):h0);
+            nal.nalType=stream->codec==Codec::Avc?(h0&31):(stream->codec==Codec::Hevc?((h0>>1)&63):(stream->codec==Codec::Av1?((h0>>3)&15):h0));
             nal.refIdc=stream->codec==Codec::Avc?((h0>>5)&3):0;
             nal.temporalId=stream->codec==Codec::Hevc&&nal.payload.size()>1?((quint8(nal.payload.at(1))&7)-1):-1;
-            nal.name=stream->codec==Codec::Avc?avcName(nal.nalType):(stream->codec==Codec::Hevc?hevcName(nal.nalType):mpeg4Name(nal.nalType));
+            nal.name=stream->codec==Codec::Avc?avcName(nal.nalType):(stream->codec==Codec::Hevc?hevcName(nal.nalType):(stream->codec==Codec::Mpeg4Visual?mpeg4Name(nal.nalType):av1Name(nal.nalType)));
             try{
                 if(stream->codec==Codec::Avc){
                     if(nal.nalType==7){auto s=parseAvcSps(nal.payload);nal.fields=s.fields;stream->sps.insert(s.id,s);stream->primarySpsId=s.id;}
@@ -792,7 +1378,7 @@ StreamPtr BitstreamParser::parseFile(const QString &path) {
                     else if(nal.nalType==34){auto p=parseHevcPps(nal.payload);nal.fields=p.fields;stream->pps.insert(p.id,p);}
                     else if(nal.nalType==39||nal.nalType==40)nal.sei=parseSei(nal.payload,stream->codec);
                     else if(isVcl(stream->codec,nal.nalType)){nal.hasSlice=true;nal.slice=parseHevcSlice(nal,stream->sps,stream->pps);nal.fields=nal.slice.fields;}
-                }else{
+                }else if(stream->codec==Codec::Mpeg4Visual){
                     if(nal.nalType==0xb0&&nal.payload.size()>1){
                         mpeg4ProfileLevel=quint8(nal.payload.at(1));
                         field(nal.fields,"profile_and_level_indication",QStringLiteral("0x%1").arg(mpeg4ProfileLevel,2,16,QChar('0')).toUpper(),"u(8)",mpeg4ProfileName(mpeg4ProfileLevel));
@@ -808,18 +1394,44 @@ StreamPtr BitstreamParser::parseFile(const QString &path) {
                     }else if(nal.nalType==0xb6){
                         nal.hasSlice=true;nal.slice=parseMpeg4Vop(nal,stream->sps.value(stream->primarySpsId));nal.fields=nal.slice.fields;
                     }
+                }else{
+                    const Av1ObuHeader obuHeader=av1ObuHeader(nal.payload);
+                    nal.temporalId=obuHeader.extension?obuHeader.temporalId:0;
+                    field(nal.fields,"obu_forbidden_bit",0,"f(1)");
+                    field(nal.fields,"obu_type",QStringLiteral("%1 (%2)").arg(obuHeader.type).arg(av1Name(obuHeader.type)),"f(4)");
+                    field(nal.fields,"obu_extension_flag",obuHeader.extension,"f(1)");
+                    field(nal.fields,"obu_has_size_field",obuHeader.hasSize,"f(1)");
+                    if(obuHeader.extension){field(nal.fields,"temporal_id",obuHeader.temporalId,"f(3)");field(nal.fields,"spatial_id",obuHeader.spatialId,"f(2)");}
+                    field(nal.fields,"obu_size",obuHeader.payloadSize,"leb128()");
+                    if(nal.nalType==1){auto sequence=parseAv1SequenceHeader(nal.payload);nal.fields+=sequence.fields;stream->sps.insert(sequence.id,sequence);stream->primarySpsId=sequence.id;}
+                    else if(nal.nalType==3||nal.nalType==6){nal.hasSlice=true;nal.slice=parseAv1FrameHeader(nal.payload,stream->sps.value(stream->primarySpsId));nal.fields+=nal.slice.fields;}
+                    else if(nal.nalType==5){QByteArray metadata=av1ObuPayload(nal.payload);int position=0;quint64 metadataType=0;if(readLeb128(metadata,position,metadata.size(),metadataType)){field(nal.fields,"metadata_type",QStringLiteral("%1 (%2)").arg(metadataType).arg(av1MetadataName(metadataType)),"leb128()");field(nal.fields,"metadata_payload_size",metadata.size()-position,"bytes");BitReader metadataBits(metadata.mid(position));if(metadataType==1&&metadataBits.bitsLeft()>=32){field(nal.fields,"max_cll",metadataBits.readBits(16),"f(16)");field(nal.fields,"max_fall",metadataBits.readBits(16),"f(16)");}else if(metadataType==2&&metadataBits.bitsLeft()>=192){for(int primary=0;primary<3;++primary){field(nal.fields,QStringLiteral("primary_chromaticity_x[%1]").arg(primary),metadataBits.readBits(16),"f(16)");field(nal.fields,QStringLiteral("primary_chromaticity_y[%1]").arg(primary),metadataBits.readBits(16),"f(16)");}field(nal.fields,"white_point_chromaticity_x",metadataBits.readBits(16),"f(16)");field(nal.fields,"white_point_chromaticity_y",metadataBits.readBits(16),"f(16)");field(nal.fields,"luminance_max",metadataBits.readBits(32),"f(32)");field(nal.fields,"luminance_min",metadataBits.readBits(32),"f(32)");}else if(metadataType==4&&metadataBits.bitsLeft()>=8){const int countryCode=int(metadataBits.readBits(8));field(nal.fields,"itu_t_t35_country_code",countryCode,"f(8)");if(countryCode==0xff&&metadataBits.bitsLeft()>=8)field(nal.fields,"itu_t_t35_country_code_extension_byte",metadataBits.readBits(8),"f(8)");field(nal.fields,"itu_t_t35_payload_bits",metadataBits.bitsLeft(),"bits");}}}
                 }
             }catch(const std::exception &e){field(nal.fields,"parse_error",QString::fromUtf8(e.what()));}
-            nal.category=nal.hasSlice?nal.slice.type:(isParameter(stream->codec,nal.nalType)?QStringLiteral("PARAM"):(!nal.sei.isEmpty()?QStringLiteral("SEI"):(stream->codec==Codec::Mpeg4Visual&&nal.nalType==0xb2?QStringLiteral("USER"):QStringLiteral("OTHER"))));
+            nal.category=nal.hasSlice?nal.slice.type:(isParameter(stream->codec,nal.nalType)?QStringLiteral("PARAM"):(!nal.sei.isEmpty()?QStringLiteral("SEI"):(stream->codec==Codec::Mpeg4Visual&&nal.nalType==0xb2?QStringLiteral("USER"):(stream->codec==Codec::Av1&&nal.nalType==5?QStringLiteral("METADATA"):(stream->codec==Codec::Av1&&nal.nalType==4?QStringLiteral("TILE"):QStringLiteral("OTHER"))))));
             if(isParameter(stream->codec,nal.nalType))stream->parameterNalIndices.push_back(i);
             stream->nals.push_back(std::move(nal));
         }
         QVector<int> pending;FrameInfo *current=nullptr;
-        for(const auto &nal:stream->nals){if(!nal.hasSlice){pending.push_back(nal.index);continue;}const bool starts=stream->containerFile?(nal.sampleIndex>=0&&(!current||current->sampleIndex!=nal.sampleIndex)):(stream->codec==Codec::Mpeg4Visual|| (stream->codec==Codec::Avc?nal.slice.firstMb==0:nal.slice.firstSlice));if(!current||starts){FrameInfo frame;frame.index=stream->frames.size();frame.sampleIndex=nal.sampleIndex;frame.nalIndices=pending;frame.offset=stream->containerFile?nal.offset:(pending.isEmpty()?nal.offset:stream->nals.at(pending.first()).offset);for(int ni:pending)if(!stream->containerFile||stream->nals.at(ni).sampleIndex>=0)frame.size+=stream->nals.at(ni).size;frame.pts=frame.index/30.0;stream->frames.push_back(frame);current=&stream->frames.last();pending.clear();}current->nalIndices.push_back(nal.index);current->sliceNalIndices.push_back(nal.index);current->size+=nal.size;current->type=nal.slice.type;}
+        for(const auto &nal:stream->nals){
+            if(!nal.hasSlice){
+                if(stream->codec==Codec::Av1&&current&&nal.nalType==4){current->nalIndices.push_back(nal.index);current->size+=nal.size;}
+                else pending.push_back(nal.index);
+                continue;
+            }
+            bool starts=false;
+            if(stream->containerFile)starts=nal.sampleIndex>=0&&(!current||current->sampleIndex!=nal.sampleIndex);
+            else if(stream->codec==Codec::Av1){
+                if(nal.sampleIndex>=0)starts=!current||current->sampleIndex!=nal.sampleIndex;
+                else{const bool temporalDelimiter=std::any_of(pending.begin(),pending.end(),[&stream](int index){return stream->nals.at(index).nalType==2;});const bool currentAlreadyShown=current&&std::any_of(current->sliceNalIndices.begin(),current->sliceNalIndices.end(),[&stream](int index){const auto &header=stream->nals.at(index).slice;return header.showFrame||header.showExistingFrame;});starts=!current||temporalDelimiter||currentAlreadyShown;}
+            }else starts=stream->codec==Codec::Mpeg4Visual||(stream->codec==Codec::Avc?nal.slice.firstMb==0:nal.slice.firstSlice);
+            if(!current||starts){FrameInfo frame;frame.index=stream->frames.size();frame.sampleIndex=nal.sampleIndex;frame.nalIndices=pending;frame.offset=stream->containerFile?nal.offset:(pending.isEmpty()?nal.offset:stream->nals.at(pending.first()).offset);for(int ni:pending)if(!stream->containerFile||stream->nals.at(ni).sampleIndex>=0)frame.size+=stream->nals.at(ni).size;frame.pts=frame.index/30.0;stream->frames.push_back(frame);current=&stream->frames.last();pending.clear();}
+            current->nalIndices.push_back(nal.index);current->sliceNalIndices.push_back(nal.index);current->size+=nal.size;current->type=nal.slice.type;
+        }
         if(current)for(int ni:pending){current->nalIndices.push_back(ni);current->size+=stream->nals.at(ni).size;}
-        const auto primary=stream->sps.value(stream->primarySpsId);stream->width=primary.width;stream->height=primary.height;stream->profile=primary.profile;stream->level=primary.level;stream->bitDepth=primary.bitDepth;stream->chroma=primary.chroma;if(stream->codec==Codec::Mpeg4Visual)stream->profileName=mpeg4ProfileName(primary.profile);
+        const auto primary=stream->sps.value(stream->primarySpsId);stream->width=primary.width;stream->height=primary.height;stream->profile=primary.profile;stream->level=primary.level;stream->bitDepth=primary.bitDepth;stream->chroma=primary.chroma;if(stream->codec==Codec::Mpeg4Visual)stream->profileName=mpeg4ProfileName(primary.profile);else if(stream->codec==Codec::Av1)stream->profileName=av1ProfileName(primary.profile,primary.level);
         if(stream->containerFile){stream->fps=mp4.fps>=1.0&&mp4.fps<=240.0?mp4.fps:25.0;stream->duration=mp4.duration;for(auto &frame:stream->frames){if(frame.sampleIndex>=0&&frame.sampleIndex<mp4.pts.size())frame.pts=mp4.pts.at(frame.sampleIndex);else frame.pts=frame.index/stream->fps;if(frame.sampleIndex>=0&&frame.sampleIndex<mp4.sampleSizes.size())frame.size=mp4.sampleSizes.at(frame.sampleIndex);}}
-        else{stream->fps=primary.fps>=1.0&&primary.fps<=240.0?primary.fps:25.0;for(auto &frame:stream->frames)frame.pts=frame.index/stream->fps;stream->duration=stream->frames.isEmpty()?0.0:stream->frames.size()/stream->fps;}
+        else{stream->fps=elementaryFps>=1.0&&elementaryFps<=240.0?elementaryFps:(primary.fps>=1.0&&primary.fps<=240.0?primary.fps:25.0);for(auto &frame:stream->frames)frame.pts=frame.index/stream->fps;stream->duration=elementaryDuration>0.0?elementaryDuration:(stream->frames.isEmpty()?0.0:stream->frames.size()/stream->fps);}
         if(stream->codec==Codec::Mpeg4Visual){
             if(stream->containerFile){
                 QVector<int> displayOrder;for(int i=0;i<stream->frames.size();++i)displayOrder.push_back(i);std::stable_sort(displayOrder.begin(),displayOrder.end(),[&stream](int a,int b){return stream->frames.at(a).pts<stream->frames.at(b).pts;});for(int display=0;display<displayOrder.size();++display)stream->frames[displayOrder.at(display)].poc=display;

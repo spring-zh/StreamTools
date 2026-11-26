@@ -13,3 +13,6 @@
 *.h265 binary
 *.hevc binary
 *.m4v binary
+*.av1 binary
+*.obu binary
+*.ivf binary
