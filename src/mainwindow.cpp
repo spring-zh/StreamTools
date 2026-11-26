@@ -6,6 +6,7 @@
 #include "hevccuprovider.h"
 #include "hevcaccess.h"
 #include "macroblockview.h"
+#include "platformwindow.h"
 #include "previewprovider.h"
 #include "timelinewidget.h"
 
@@ -149,6 +150,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     buildUi();
     buildMenus();
     applyTheme();
+    configurePlatformWindow(this);
     m_previews = new PreviewProvider(this);
     m_hevcCuProvider = new HevcCuProvider(this);
     m_av1BlockProvider = new Av1BlockProvider(this);
@@ -275,13 +277,22 @@ void MainWindow::requestFileView()
 
 void MainWindow::buildUi() {
     auto *central = new QWidget(this);
+    central->setObjectName(QStringLiteral("appSurface"));
     auto *root = new QVBoxLayout(central);
+#ifdef Q_OS_MACOS
+    root->setContentsMargins(14, 14, 14, 10);
+#else
     root->setContentsMargins(14, 12, 14, 10);
+#endif
     root->setSpacing(10);
 
-    auto *top = new QHBoxLayout;
-    auto *brand = new QLabel(QStringLiteral("<b style='font-size:19px;color:#f1f6fb'>BitScope</b>  <span style='color:#19c2c9'>Stream Analyzer</span>"), central);
-    m_fileLabel = new QLabel(QStringLiteral("尚未打开码流"), central);
+    auto *topBar = new QFrame(central);
+    topBar->setObjectName(QStringLiteral("topBar"));
+    auto *top = new QHBoxLayout(topBar);
+    top->setContentsMargins(0, 0, 0, 1);
+    auto *brand = new QLabel(QStringLiteral("<b style='font-size:20px;color:#f4f8fc'>BitScope</b>  <span style='color:#2bc5cc'>Stream Analyzer</span>"), topBar);
+    brand->setObjectName(QStringLiteral("brand"));
+    m_fileLabel = new QLabel(QStringLiteral("尚未打开码流"), topBar);
     m_fileLabel->setObjectName(QStringLiteral("fileLabel"));
     m_fileLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     auto *titleBox = new QVBoxLayout;
@@ -289,11 +300,11 @@ void MainWindow::buildUi() {
     titleBox->addWidget(brand);
     titleBox->addWidget(m_fileLabel);
     top->addLayout(titleBox, 1);
-    auto *open = new QPushButton(QStringLiteral("打开码流…"), central);
+    auto *open = new QPushButton(QStringLiteral("打开码流…"), topBar);
     open->setObjectName(QStringLiteral("primaryButton"));
     connect(open, &QPushButton::clicked, this, &MainWindow::chooseFile);
     top->addWidget(open);
-    root->addLayout(top);
+    root->addWidget(topBar);
 
     auto *metrics = new QHBoxLayout;
     m_codecMetric = metricLabel(QStringLiteral("编码"), central);
@@ -541,14 +552,18 @@ void MainWindow::applyTheme() {
     qApp->setStyle(QStringLiteral("Fusion"));
     setStyleSheet(QStringLiteral(R"(
         QMainWindow, QWidget { background:#0b1119; color:#dbe5ef; font-size:13px; }
+        #appSurface { background:#0b1119; }
+        #topBar { background:transparent; border:0; }
+        #brand { background:transparent; }
         QMenuBar, QMenu, QStatusBar { background:#0d151f; color:#cdd8e4; }
         QMenu::item:selected { background:#18354a; }
         #fileLabel, #hint { color:#8191a5; }
         #frameStats { background:#101923; color:#b8c7d8; border:1px solid #243343; border-radius:6px; padding:7px 10px; }
         #metric { background:#101923; border:1px solid #1e2d3d; border-radius:7px; padding:8px 12px; }
         #toolbar, #timelineBox { background:#0f1822; border:1px solid #1e2d3d; border-radius:7px; }
-        #primaryButton { background:#19aeb5; color:#061014; border:0; border-radius:6px; padding:9px 17px; font-weight:700; }
-        #primaryButton:hover { background:#29c4cb; }
+        #primaryButton { background:#22b7c0; color:#061014; border:0; border-radius:7px; padding:9px 18px; font-weight:700; }
+        #primaryButton:hover { background:#35c8d0; }
+        #primaryButton:pressed { background:#179ca4; }
         QLineEdit, QComboBox, QPlainTextEdit, QTextBrowser, QTreeWidget, QTableView {
             background:#0d151f; color:#dbe5ef; border:1px solid #243343; border-radius:5px;
             selection-background-color:#15536b; selection-color:white;

@@ -14,6 +14,7 @@ set(CMAKE_AUTOMOC_COMPILER_PREDEFINES OFF)
 
 qt_add_executable(BitScopeQt
     src/main.cpp
+    src/platformwindow.h
     src/bitstreamtypes.h
     src/bitreader.h
     src/bitstreamparser.h
@@ -34,6 +35,12 @@ qt_add_executable(BitScopeQt
     src/mainwindow.h
     src/mainwindow.cpp
 )
+
+if(APPLE)
+    enable_language(OBJCXX)
+    target_sources(BitScopeQt PRIVATE src/platformwindow_mac.mm)
+    target_link_libraries(BitScopeQt PRIVATE "-framework Cocoa")
+endif()
 
 set(BITSCOPE_HEVC_ANALYZER "" CACHE FILEPATH
     "Optional HM_180 analyzer executable to bundle for HEVC CU-tree extraction")
