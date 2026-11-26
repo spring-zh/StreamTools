@@ -3,6 +3,7 @@
 
 #include <QCoreApplication>
 #include <QDebug>
+#include <QSet>
 #include <QTimer>
 
 #include <algorithm>
@@ -12,8 +13,8 @@ using namespace bitscope;
 int main(int argc, char **argv)
 {
     QCoreApplication application(argc, argv);
-    if (argc != 3) {
-        qCritical() << "usage: BitScopeHevcCuSmoke <hevc-file> <HM_180-helper>";
+    if (argc < 3 || argc > 5) {
+        qCritical() << "usage: BitScopeHevcCuSmoke <hevc-file> <HM_180-helper> [first-frame] [last-frame]";
         return 2;
     }
     qputenv("BITSCOPE_HEVC_ANALYZER", argv[2]);
@@ -26,12 +27,25 @@ int main(int argc, char **argv)
 
     HevcCuProvider provider;
     provider.setStream(stream);
-    const int targetFrame = std::min(45, int(stream->frames.size()) - 1);
+    bool firstOk = argc == 3;
+    bool lastOk = argc < 5;
+    const int firstFrame = argc >= 4
+        ? QString::fromLocal8Bit(argv[3]).toInt(&firstOk) : 45;
+    const int lastFrame = argc == 5
+        ? QString::fromLocal8Bit(argv[4]).toInt(&lastOk) : firstFrame;
+    if (!firstOk || !lastOk || firstFrame < 0 || lastFrame < firstFrame
+        || lastFrame >= stream->frames.size()) {
+        qCritical() << "invalid target range" << firstFrame << lastFrame;
+        return 7;
+    }
+    QSet<int> pending;
+    for (int frame = firstFrame; frame <= lastFrame; ++frame)
+        pending.insert(frame);
     int exitCode = 4;
     QObject::connect(&provider, &HevcCuProvider::codingUnitsReady,
                      &application, [&](int frameIndex,
                                        const QVector<HevcCodingUnitInfo> &units) {
-        if (frameIndex != targetFrame)
+        if (!pending.contains(frameIndex))
             return;
         qint64 coveredPixels = 0;
         bool hasQp = false;
@@ -45,13 +59,21 @@ int main(int argc, char **argv)
                 << stream->frames.at(frameIndex).poc << "coding units" << units.size()
                 << "QP" << hasQp << "split" << hasSplit << "coverage"
                 << coveredPixels << "/" << qint64(stream->width) * stream->height;
-        exitCode = !units.isEmpty() && hasQp
-                && coveredPixels == qint64(stream->width) * stream->height ? 0 : 5;
-        application.quit();
+        if (units.isEmpty() || !hasQp
+            || coveredPixels != qint64(stream->width) * stream->height) {
+            exitCode = 5;
+            application.quit();
+            return;
+        }
+        pending.remove(frameIndex);
+        if (pending.isEmpty()) {
+            exitCode = 0;
+            application.quit();
+        }
     });
     QObject::connect(&provider, &HevcCuProvider::codingUnitsUnavailable,
                      &application, [&](int frameIndex, const QString &reason) {
-        if (frameIndex == targetFrame) {
+        if (pending.contains(frameIndex)) {
             qCritical() << reason;
             exitCode = 6;
             application.quit();
@@ -61,7 +83,10 @@ int main(int argc, char **argv)
         qCritical() << "HEVC coding unit extraction timed out";
         application.quit();
     });
-    provider.requestFrame(targetFrame);
+    if (firstFrame == lastFrame)
+        provider.requestFrame(firstFrame);
+    else
+        provider.requestRange(firstFrame, lastFrame);
     application.exec();
     return exitCode;
 }

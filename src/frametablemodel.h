@@ -20,6 +20,7 @@ public:
     Mode mode() const { return m_mode; }
     StreamPtr stream() const { return m_stream; }
     void setThumbnail(int frameIndex, const QImage &image);
+    void setThumbnailError(int frameIndex, const QString &error);
     QImage thumbnail(int frameIndex) const;
 
     int rowCount(const QModelIndex &parent = {}) const override;
@@ -36,6 +37,7 @@ private:
     StreamPtr m_stream;
     Mode m_mode = Mode::Frames;
     QHash<int,QImage> m_thumbnails;
+    QHash<int,QString> m_thumbnailErrors;
     QList<int> m_thumbnailLru;
 };
 

@@ -18,6 +18,7 @@ qt_add_executable(BitScopeQt
     src/bitreader.h
     src/bitstreamparser.h
     src/bitstreamparser.cpp
+    src/hevcaccess.h
     src/frametablemodel.h
     src/frametablemodel.cpp
     src/previewprovider.h
@@ -138,10 +139,25 @@ if(BITSCOPE_BUILD_TESTS)
         src/bitreader.h
         src/bitstreamparser.h
         src/bitstreamparser.cpp
+        src/hevcaccess.h
         src/hevccuprovider.h
         src/hevccuprovider.cpp
     )
     target_include_directories(BitScopeHevcCuSmoke PRIVATE src)
     target_link_libraries(BitScopeHevcCuSmoke PRIVATE Qt6::Core Qt6::Gui)
     target_compile_definitions(BitScopeHevcCuSmoke PRIVATE QT_NO_KEYWORDS)
+
+    qt_add_executable(BitScopePreviewSmoke
+        tests/previewprovider_smoke.cpp
+        src/bitstreamtypes.h
+        src/bitreader.h
+        src/bitstreamparser.h
+        src/bitstreamparser.cpp
+        src/hevcaccess.h
+        src/previewprovider.h
+        src/previewprovider.cpp
+    )
+    target_include_directories(BitScopePreviewSmoke PRIVATE src)
+    target_link_libraries(BitScopePreviewSmoke PRIVATE Qt6::Core Qt6::Gui)
+    target_compile_definitions(BitScopePreviewSmoke PRIVATE QT_NO_KEYWORDS)
 endif()

@@ -98,6 +98,7 @@ python3 -m http.server 8765
 - AV1 解析 OBU header、Sequence Header、Frame Header / Frame OBU、Tile Group 与 Metadata OBU，显示 profile/level、位深、色度采样、Superblock 尺寸、Order Hint、reference slots 和 `refresh_frame_flags`
 - AV1 通过 libaom inspection 按需导出真实 Coding Block；支持 4×4 到 128×128 及 4×8、8×4、16×64、64×16 等非方形块，显示 Y/UV 预测模式、变换尺寸/类型、块级 QIndex、Segment、Skip、IntraBC、参考帧和运动矢量，并提供 QIndex 热力图与当前帧统计
 - AV1 与 H.265 块分析采用“当前帧优先”：根网格和 Slice 范围立即显示；选中帧画面一生成就以正常优先级单独补充叶子块，完成后再低优先级预取可见帧；切换帧会取消旧预取。H.265 只输出请求帧的 CU 文本，AV1 只序列化目标范围的 inspection JSON
+- H.265 预览区分 IDR/BLA、CRA 与前导 RASL：从 CRA 按需解码时会校正被抑制图像造成的编号偏移，并按 MP4 PTS 将显示顺序画面对回解码顺序帧；真正失败的缩略图会显示错误状态，重新选中可重试
 - H.265 通过参考解码器按需导出 CTU 内部四叉树；独立的“CTU / CU”页面显示每个叶子 CU 的编码尺寸、深度、分区模式、预测类别、QP 和近似 CABAC 字节数
 - MP4 / MOV 中的 H.264、H.265、MPEG-4 Part 2 和 AV1 视频轨道，支持解析采样表、长度前缀 NAL、`mp4v/esds` 与 `av01/av1C`；“文件视图”按层级显示 ISO BMFF Box、偏移、大小、关键字段和 Hex
 - 独立区分 IDR、普通 I、I/P 混合 Slice，以及完整帧、多 Slice 分片帧和起始分片缺失

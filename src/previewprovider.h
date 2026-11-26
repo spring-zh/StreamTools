@@ -55,6 +55,7 @@ private:
     int m_activeEnd = 0;
     int m_priorityFrame = -1;
     int m_job = 0;
+    bool m_cancelled = false;
     QString m_activeInput;
     QString m_activePrefix;
     QTimer m_queueTimer;

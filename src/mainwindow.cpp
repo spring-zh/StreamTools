@@ -4,6 +4,7 @@
 #include "bitstreamparser.h"
 #include "frametablemodel.h"
 #include "hevccuprovider.h"
+#include "hevcaccess.h"
 #include "macroblockview.h"
 #include "previewprovider.h"
 #include "timelinewidget.h"
@@ -187,6 +188,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     connect(m_model, &FrameTableModel::thumbnailEvicted, m_previews, &PreviewProvider::forgetFrame);
     connect(m_previews, &PreviewProvider::statusChanged, m_status, &QLabel::setText);
     connect(m_previews, &PreviewProvider::previewFailed, this, [this](int frame, const QString &reason) {
+        m_model->setThumbnailError(frame, reason.left(500));
         m_macroView->setFrameError(frame, reason.left(500));
         if (m_table->currentIndex().data(FrameTableModel::ItemIndexRole).toInt() == frame) {
             m_status->setText(QStringLiteral("Frame %1 预览失败：%2").arg(frame).arg(reason.left(180)));
@@ -841,7 +843,10 @@ void MainWindow::showFrame(int frameIndex) {
     m_macroView->setFrame(frameIndex);
     const QImage cached = m_model->thumbnail(frameIndex);
     if (!cached.isNull()) m_macroView->setFrameImage(frameIndex, cached);
-    if (cached.isNull()) m_previews->requestFrame(frameIndex);
+    if (cached.isNull()) {
+        m_model->setThumbnailError(frameIndex, {});
+        m_previews->requestFrame(frameIndex);
+    }
     else requestCurrentBlockData(frameIndex);
     if (!cached.isNull() && m_previews->isIdle()) requestVisibleBlockData();
     m_timeline->setSelectedFrame(frameIndex);
@@ -1103,16 +1108,7 @@ void MainWindow::updateFrameStatistics(int frameIndex)
     const int totalUnits = frame.unitColumns * frame.unitRows;
     if (m_stream->codec == Codec::Hevc) {
         if (!frame.hevcCodingUnitsReady) {
-            int dependencyStart = 0;
-            for (int index = frameIndex; index >= 0; --index) {
-                const FrameInfo &candidate = m_stream->frames.at(index);
-                if (candidate.randomAccess
-                    || (candidate.recoveryPoint
-                        && index + std::max(0, candidate.recoveryFrameCount) <= frameIndex)) {
-                    dependencyStart = index;
-                    break;
-                }
-            }
+            const int dependencyStart = nearestHevcDecodeStart(m_stream, frameIndex);
             const QString state = frame.hevcCodingUnitsError.isEmpty()
                 ? QStringLiteral("CTU 根网格和 Slice 范围已就绪；正在从 F%1 连续解码 %2 帧，补充叶子 CU、QP 和预测信息…")
                       .arg(dependencyStart).arg(frameIndex - dependencyStart + 1)

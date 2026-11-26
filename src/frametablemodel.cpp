@@ -12,7 +12,7 @@ namespace bitscope {
 FrameTableModel::FrameTableModel(QObject *parent) : QAbstractTableModel(parent) {}
 
 void FrameTableModel::setStream(StreamPtr stream) {
-    beginResetModel();m_stream=std::move(stream);m_thumbnails.clear();m_thumbnailLru.clear();endResetModel();
+    beginResetModel();m_stream=std::move(stream);m_thumbnails.clear();m_thumbnailErrors.clear();m_thumbnailLru.clear();endResetModel();
 }
 
 void FrameTableModel::setMode(Mode mode) {
@@ -20,7 +20,12 @@ void FrameTableModel::setMode(Mode mode) {
 }
 
 void FrameTableModel::setThumbnail(int frameIndex,const QImage &image) {
-    if(image.isNull())return;m_thumbnails.insert(frameIndex,image);m_thumbnailLru.removeAll(frameIndex);m_thumbnailLru.append(frameIndex);constexpr int maxCachedThumbnails=180;while(m_thumbnailLru.size()>maxCachedThumbnails){const int evicted=m_thumbnailLru.takeFirst();m_thumbnails.remove(evicted);Q_EMIT thumbnailEvicted(evicted);if(m_mode==Mode::Frames&&evicted>=0&&evicted<rowCount())Q_EMIT dataChanged(index(evicted,1),index(evicted,1),{Qt::DecorationRole,Qt::DisplayRole});}if(m_mode==Mode::Frames&&frameIndex>=0&&frameIndex<rowCount())Q_EMIT dataChanged(index(frameIndex,1),index(frameIndex,1),{Qt::DecorationRole,Qt::DisplayRole});
+    if(image.isNull())return;m_thumbnailErrors.remove(frameIndex);m_thumbnails.insert(frameIndex,image);m_thumbnailLru.removeAll(frameIndex);m_thumbnailLru.append(frameIndex);constexpr int maxCachedThumbnails=180;while(m_thumbnailLru.size()>maxCachedThumbnails){const int evicted=m_thumbnailLru.takeFirst();m_thumbnails.remove(evicted);Q_EMIT thumbnailEvicted(evicted);if(m_mode==Mode::Frames&&evicted>=0&&evicted<rowCount())Q_EMIT dataChanged(index(evicted,1),index(evicted,1),{Qt::DecorationRole,Qt::DisplayRole});}if(m_mode==Mode::Frames&&frameIndex>=0&&frameIndex<rowCount())Q_EMIT dataChanged(index(frameIndex,1),index(frameIndex,1),{Qt::DecorationRole,Qt::DisplayRole,Qt::ToolTipRole,Qt::ForegroundRole});
+}
+
+void FrameTableModel::setThumbnailError(int frameIndex, const QString &error) {
+    if(error.isEmpty())m_thumbnailErrors.remove(frameIndex);else m_thumbnailErrors.insert(frameIndex,error);
+    if(m_mode==Mode::Frames&&frameIndex>=0&&frameIndex<rowCount())Q_EMIT dataChanged(index(frameIndex,1),index(frameIndex,1),{Qt::DisplayRole,Qt::ToolTipRole,Qt::ForegroundRole});
 }
 
 QImage FrameTableModel::thumbnail(int frameIndex) const { return m_thumbnails.value(frameIndex); }
@@ -38,10 +43,11 @@ QVariant FrameTableModel::data(const QModelIndex &idx,int role) const {
         if(role==Qt::SizeHintRole&&idx.column()==1)return QSize(104,58);
         if(role==Qt::DecorationRole&&idx.column()==1){const auto image=m_thumbnails.value(f.index);if(!image.isNull())return QPixmap::fromImage(image.scaled(96,54,Qt::KeepAspectRatio,Qt::SmoothTransformation));return{};}
         if(role==Qt::TextAlignmentRole)return idx.column()==0||idx.column()==6||idx.column()==7?Qt::AlignCenter:Qt::AlignVCenter;
+        if(role==Qt::ForegroundRole&&idx.column()==1&&!m_thumbnailErrors.value(f.index).isEmpty())return QBrush(QColor("#ff7b72"));
         if(role==Qt::ForegroundRole&&idx.column()==2){if(f.randomAccess)return QBrush(QColor("#42d392"));if(f.displayType.contains(QStringLiteral("INTRA"))||(m_stream->codec!=Codec::Av1&&f.displayType.contains('I')))return QBrush(QColor("#f4a261"));if(f.displayType.contains('B'))return QBrush(QColor("#9b87f5"));return QBrush(QColor("#58a6ff"));}
         if(role==Qt::FontRole&&(idx.column()==0||idx.column()==5)){QFont font(QStringLiteral("Menlo"));font.setStyleHint(QFont::Monospace);font.setPointSize(9);return font;}
         if(role!=Qt::DisplayRole&&role!=Qt::ToolTipRole)return{};
-        switch(idx.column()){case 0:return QStringLiteral("%1").arg(f.index,4,10,QChar('0'));case 1:return m_thumbnails.contains(f.index)?QString():QStringLiteral("按需加载");case 2:return f.displayType;case 3:return f.structure;case 4:return timeText(f.pts);case 5:return QStringLiteral("0x%1").arg(f.offset,8,16,QChar('0')).toUpper();case 6:return bytesText(f.size);case 7:return f.poc>=0?QVariant(f.poc):QVariant(QStringLiteral("—"));case 8:return f.references.isEmpty()?(f.index==0&&f.displayType.contains('P')?QStringLiteral("⚠ 文件外"):QStringLiteral("—")):QStringLiteral("L0 #%1").arg(f.references.first());default:return{};}
+        switch(idx.column()){case 0:return QStringLiteral("%1").arg(f.index,4,10,QChar('0'));case 1:if(role==Qt::ToolTipRole&&!m_thumbnailErrors.value(f.index).isEmpty())return m_thumbnailErrors.value(f.index);return m_thumbnails.contains(f.index)?QString():(m_thumbnailErrors.contains(f.index)?QStringLiteral("加载失败"):QStringLiteral("按需加载"));case 2:return f.displayType;case 3:return f.structure;case 4:return timeText(f.pts);case 5:return QStringLiteral("0x%1").arg(f.offset,8,16,QChar('0')).toUpper();case 6:return bytesText(f.size);case 7:return f.poc>=0?QVariant(f.poc):QVariant(QStringLiteral("—"));case 8:return f.references.isEmpty()?(f.index==0&&f.displayType.contains('P')?QStringLiteral("⚠ 文件外"):QStringLiteral("—")):QStringLiteral("L0 #%1").arg(f.references.first());default:return{};}
     }
     const auto &n=m_stream->nals.at(idx.row());if(role==ItemIndexRole)return n.index;if(role==TypeRole)return n.category;if(role==SearchTextRole)return QStringLiteral("%1 %2 %3 %4").arg(n.index).arg(n.name,n.category).arg(n.offset,0,16);if(role==Qt::ForegroundRole&&idx.column()==1)return QBrush(n.category=="PARAM"?QColor("#f4a261"):n.category=="SEI"?QColor("#f4a261"):QColor("#8fa1b5"));if(role==Qt::FontRole&&(idx.column()==0||idx.column()==3)){QFont font(QStringLiteral("Menlo"));font.setStyleHint(QFont::Monospace);font.setPointSize(9);return font;}if(role!=Qt::DisplayRole&&role!=Qt::ToolTipRole)return{};
     switch(idx.column()){case 0:return QStringLiteral("%1").arg(n.index,4,10,QChar('0'));case 1:return n.category;case 2:return m_stream->codec==Codec::Mpeg4Visual?(QStringLiteral("0x%1").arg(n.nalType,2,16,QChar('0')).toUpper()+QStringLiteral(" · ")+n.name):QStringLiteral("%1 · %2").arg(n.nalType).arg(n.name);case 3:return QStringLiteral("0x%1").arg(n.offset,8,16,QChar('0')).toUpper();case 4:return bytesText(n.size);case 5:return n.temporalId>=0?QVariant(n.temporalId):QVariant(QStringLiteral("—"));default:return{};}

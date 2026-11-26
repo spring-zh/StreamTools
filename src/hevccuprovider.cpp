@@ -1,4 +1,5 @@
 #include "hevccuprovider.h"
+#include "hevcaccess.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -191,17 +192,7 @@ void HevcCuProvider::requestRange(int first, int last)
 
 int HevcCuProvider::nearestStart(int frameIndex) const
 {
-    if (!m_stream || frameIndex <= 0)
-        return 0;
-    for (int index = frameIndex; index >= 0; --index) {
-        const FrameInfo &frame = m_stream->frames.at(index);
-        if (frame.randomAccess)
-            return index;
-        if (frame.recoveryPoint
-            && index + std::max(0, frame.recoveryFrameCount) <= frameIndex)
-            return index;
-    }
-    return 0;
+    return nearestHevcDecodeStart(m_stream, frameIndex);
 }
 
 QByteArray HevcCuProvider::accessUnit(int frameIndex, bool includeParameters) const
@@ -283,7 +274,8 @@ void HevcCuProvider::processQueue()
     QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
     QStringList outputFrames;
     for (int index : m_activeRequested)
-        outputFrames.push_back(QString::number(index - m_activeStart));
+        outputFrames.push_back(QString::number(
+            hevcDecoderOutputOrdinal(m_stream, m_activeStart, index)));
     m_activeOutputFiltered = !outputFrames.isEmpty();
     environment.insert(QStringLiteral("BITSCOPE_HEVC_OUTPUT_FRAMES"),
                        outputFrames.join(QLatin1Char(',')));

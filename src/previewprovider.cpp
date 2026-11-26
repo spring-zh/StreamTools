@@ -1,4 +1,5 @@
 #include "previewprovider.h"
+#include "hevcaccess.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -22,7 +23,7 @@ PreviewProvider::PreviewProvider(QObject *parent) : QObject(parent) {
 
 PreviewProvider::~PreviewProvider(){if(m_process.state()!=QProcess::NotRunning){m_process.kill();m_process.waitForFinished(1000);}}
 
-void PreviewProvider::setStream(StreamPtr stream){if(m_process.state()!=QProcess::NotRunning){m_process.kill();m_process.waitForFinished(1000);}m_stream=std::move(stream);m_pending.clear();m_cached.clear();m_failed.clear();m_activeRequested.clear();m_activeOutputOrder.clear();m_priorityFrame=-1;clearActiveFiles();}
+void PreviewProvider::setStream(StreamPtr stream){if(m_process.state()!=QProcess::NotRunning){m_cancelled=true;m_process.kill();m_process.waitForFinished(1000);m_cancelled=false;}m_stream=std::move(stream);m_pending.clear();m_cached.clear();m_failed.clear();m_activeRequested.clear();m_activeOutputOrder.clear();m_priorityFrame=-1;clearActiveFiles();}
 
 namespace {
 
@@ -76,7 +77,7 @@ QString PreviewProvider::ffmpegPath() const {
     return QStandardPaths::findExecutable(name);
 }
 
-void PreviewProvider::requestFrame(int frameIndex){m_pending.clear();m_priorityFrame=frameIndex;requestRange(frameIndex,frameIndex);}
+void PreviewProvider::requestFrame(int frameIndex){m_pending.clear();m_failed.remove(frameIndex);if(m_process.state()!=QProcess::NotRunning&&m_activeRequested.contains(frameIndex))return;m_priorityFrame=frameIndex;if(m_process.state()!=QProcess::NotRunning){m_cancelled=true;m_process.kill();m_activeRequested.clear();}requestRange(frameIndex,frameIndex);}
 void PreviewProvider::forgetFrame(int frameIndex){m_cached.remove(frameIndex);}
 bool PreviewProvider::isIdle() const{return m_pending.isEmpty()&&m_process.state()==QProcess::NotRunning&&!m_queueTimer.isActive();}
 
@@ -86,6 +87,8 @@ int PreviewProvider::nearestStart(int frameIndex) const
 {
     if (!m_stream || frameIndex <= 0)
         return 0;
+    if (m_stream->codec == Codec::Hevc)
+        return nearestHevcDecodeStart(m_stream, frameIndex);
     for (int index = frameIndex; index >= 0; --index) {
         const auto &frame = m_stream->frames.at(index);
         // IDR/IRAP is immediately safe. A Recovery Point is only safe for a
@@ -114,7 +117,16 @@ void PreviewProvider::processQueue(){if(!m_stream||m_pending.isEmpty()||m_proces
     QList<int> sorted=m_pending.values();std::sort(sorted.begin(),sorted.end());const int anchor=m_pending.contains(m_priorityFrame)?m_priorityFrame:sorted.first();m_priorityFrame=-1;m_activeStart=nearestStart(anchor);m_activeRequested.clear();m_activeEnd=anchor;
     for(int index:sorted){if(nearestStart(index)==m_activeStart&&index<=anchor+64){m_activeRequested.push_back(index);m_activeEnd=std::max(m_activeEnd,index);}}
     for(int index:m_activeRequested)m_pending.remove(index);
-    m_activeOutputOrder.clear();for(int index=m_activeStart;index<=m_activeEnd;++index)m_activeOutputOrder.push_back(index);if(m_stream->codec==Codec::Mpeg4Visual)std::stable_sort(m_activeOutputOrder.begin(),m_activeOutputOrder.end(),[this](int a,int b){return m_stream->frames.at(a).pts<m_stream->frames.at(b).pts;});
+    m_activeOutputOrder.clear();
+    for(int index=m_activeStart;index<=m_activeEnd;++index){
+        if(m_stream->codec!=Codec::Hevc
+            || !hevcFrameSuppressedAtStart(m_stream,m_activeStart,index))
+            m_activeOutputOrder.push_back(index);
+    }
+    if(m_stream->containerFile
+        && (m_stream->codec==Codec::Avc||m_stream->codec==Codec::Hevc
+            ||m_stream->codec==Codec::Mpeg4Visual))
+        std::stable_sort(m_activeOutputOrder.begin(),m_activeOutputOrder.end(),[this](int a,int b){return m_stream->frames.at(a).pts<m_stream->frames.at(b).pts;});
     const QString suffix=m_stream->codec==Codec::Avc?QStringLiteral("h264"):(m_stream->codec==Codec::Hevc?QStringLiteral("h265"):(m_stream->codec==Codec::Mpeg4Visual?QStringLiteral("m4v"):QStringLiteral("obu")));
     const int job=m_job++;m_activePrefix=QDir(m_temp.path()).filePath(QStringLiteral("preview_%1_").arg(job));m_activeInput=QDir(m_temp.path()).filePath(QStringLiteral("preview_%1.%2").arg(job).arg(suffix));QFile input(m_activeInput);if(!input.open(QIODevice::WriteOnly)){for(int index:m_activeRequested)Q_EMIT previewFailed(index,input.errorString());if(!m_pending.isEmpty())m_queueTimer.start();else Q_EMIT queueIdle();return;}input.write(segment(m_activeStart,m_activeEnd));input.close();
     const QString output=m_activePrefix+QStringLiteral("%05d.jpg");const QString fps=QString::number(m_stream->fps,'f',3);
@@ -122,12 +134,21 @@ void PreviewProvider::processQueue(){if(!m_stream||m_pending.isEmpty()||m_proces
     QStringList args{QStringLiteral("-hide_banner"),QStringLiteral("-loglevel"),macroblockDebug?QStringLiteral("debug"):QStringLiteral("error")};
     if(macroblockDebug)args<<QStringLiteral("-threads")<<QStringLiteral("1")<<QStringLiteral("-debug")<<QStringLiteral("qp+mb_type")<<QStringLiteral("-probesize")<<QStringLiteral("32")<<QStringLiteral("-analyzeduration")<<QStringLiteral("0");
     const QString demuxer=m_stream->codec==Codec::Avc?QStringLiteral("h264"):(m_stream->codec==Codec::Hevc?QStringLiteral("hevc"):(m_stream->codec==Codec::Mpeg4Visual?QStringLiteral("m4v"):QStringLiteral("obu")));
-    args<<QStringLiteral("-fflags")<<QStringLiteral("+genpts")<<QStringLiteral("-err_detect")<<QStringLiteral("ignore_err")<<QStringLiteral("-flags")<<QStringLiteral("+output_corrupt")<<QStringLiteral("-r")<<fps<<QStringLiteral("-f")<<demuxer<<QStringLiteral("-i")<<m_activeInput<<QStringLiteral("-an")<<QStringLiteral("-vf")<<QStringLiteral("scale=320:-2")<<QStringLiteral("-fps_mode")<<QStringLiteral("passthrough")<<QStringLiteral("-q:v")<<QStringLiteral("5")<<QStringLiteral("-start_number")<<QStringLiteral("0")<<QStringLiteral("-frames:v")<<QString::number(m_activeEnd-m_activeStart+1)<<QStringLiteral("-y")<<output;
+    args<<QStringLiteral("-fflags")<<QStringLiteral("+genpts")<<QStringLiteral("-err_detect")<<QStringLiteral("ignore_err")<<QStringLiteral("-flags")<<QStringLiteral("+output_corrupt")<<QStringLiteral("-r")<<fps<<QStringLiteral("-f")<<demuxer<<QStringLiteral("-i")<<m_activeInput<<QStringLiteral("-an")<<QStringLiteral("-vf")<<QStringLiteral("scale=320:-2")<<QStringLiteral("-fps_mode")<<QStringLiteral("passthrough")<<QStringLiteral("-q:v")<<QStringLiteral("5")<<QStringLiteral("-start_number")<<QStringLiteral("0")<<QStringLiteral("-frames:v")<<QString::number(m_activeOutputOrder.size())<<QStringLiteral("-y")<<output;
     Q_EMIT statusChanged(QStringLiteral("正在生成预览 F%1–F%2 · %3").arg(m_activeStart).arg(m_activeEnd).arg(executable));m_process.start(executable,args);
 }
 
 void PreviewProvider::processFinished(int exitCode, QProcess::ExitStatus status)
 {
+    if (m_cancelled) {
+        m_cancelled = false;
+        clearActiveFiles();
+        if (!m_pending.isEmpty())
+            m_queueTimer.start();
+        else
+            Q_EMIT queueIdle();
+        return;
+    }
     const QByteArray stderrData = m_process.readAllStandardError();
     const QString stderrText = QString::fromLocal8Bit(stderrData).trimmed();
     if (status != QProcess::NormalExit || exitCode != 0) {
@@ -289,7 +310,7 @@ QVector<QVector<DecodedUnitInfo>> PreviewProvider::parseAvcDecodedUnits(const QB
     return result;
 }
 
-void PreviewProvider::processError(QProcess::ProcessError error){if(error==QProcess::FailedToStart){for(int index:m_activeRequested){m_failed.insert(index);Q_EMIT previewFailed(index,QStringLiteral("FFmpeg 无法启动：%1").arg(m_process.errorString()));}clearActiveFiles();if(!m_pending.isEmpty())m_queueTimer.start();}}
+void PreviewProvider::processError(QProcess::ProcessError error){if(m_cancelled)return;if(error==QProcess::FailedToStart){for(int index:m_activeRequested){m_failed.insert(index);Q_EMIT previewFailed(index,QStringLiteral("FFmpeg 无法启动：%1").arg(m_process.errorString()));}clearActiveFiles();if(!m_pending.isEmpty())m_queueTimer.start();}}
 
 void PreviewProvider::clearActiveFiles(){if(!m_activeInput.isEmpty())QFile::remove(m_activeInput);if(!m_activePrefix.isEmpty()){QDir dir(m_temp.path());const QString stem=QFileInfo(m_activePrefix).fileName();for(const QString &name:dir.entryList({stem+QStringLiteral("*.jpg")},QDir::Files))dir.remove(name);}m_activeInput.clear();m_activePrefix.clear();}
 
