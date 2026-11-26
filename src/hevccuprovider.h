@@ -47,6 +47,7 @@ private:
     int m_activeStart = 0;
     int m_activeEnd = 0;
     int m_job = 0;
+    int m_priorityFrame = -1;
     QString m_activeInput;
     QString m_activeDirectory;
     QTimer m_queueTimer;

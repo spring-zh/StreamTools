@@ -24,6 +24,8 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 若要启用 AV1 真实 Coding Block、块级 QIndex、预测/变换模式、参考帧和运动矢量，先将官方 libaom 以 inspection 模式构建，再把 `inspect` 帮助程序打包进应用：
 
 ```bash
+git -C /path/to/aom apply \
+  /path/to/BitScope/third_party/aom-inspection/inspect-output-start.patch
 cmake -S /path/to/aom -B /path/to/aom-build -DCMAKE_BUILD_TYPE=Release \
   -DCONFIG_INSPECTION=1 -DENABLE_EXAMPLES=1 -DENABLE_TESTS=0
 cmake --build /path/to/aom-build --target inspect --parallel
@@ -86,15 +88,15 @@ python3 -m http.server 8765
 - 码流单元列表：H.264/H.265 NAL、MPEG-4 Visual 起始码或 AV1 OBU 类型、偏移、大小与时间层
 - 按帧聚合：I / P / B / S 或 AV1 KEY / INTER / INTRA_ONLY / SWITCH / SHOW_EXISTING，PTS、POC / Order Hint、大小与帧头数量
 - 后台解析大文件，主界面保持响应
-- 帧列表按可见区域分批调用本机 FFmpeg 生成缩略图；从最近的随机访问点 / Recovery Point 解码并缓存
+- 帧列表按可见区域分批调用本机 FFmpeg 生成缩略图；当前选中帧优先于其他缩略图，从最近的随机访问点 / Recovery Point 解码并缓存
 - 缩略图使用 180 帧上限的 LRU 缓存，长时间滚动大码流时不会无限增加内存占用
 - 每帧画面预览以及 H.264 宏块、H.265 CTU/CU、AV1 64×64 或 128×128 Superblock 与实际 Coding Block 边界、地址、当前可见尺寸和像素坐标；边缘不完整单元按原图像素比例绘制，支持工具栏或滚轮缩放、放大后拖动和双击恢复适合窗口
 - H.264 软件解码后的逐宏块实际 QP、预测类型码、QP 热力图，以及当前帧 QP 平均值、中位数、最小/最大值、标准差和宏块类型占比
 - MPEG-4 Part 2 Visual 解析 Visual Object Sequence、VOL、GOV 和 VOP，显示 I/P/B/S-VOP、`vop_time_increment`、`vop_quant`、f-code、宏块实际 QP/预测类型、参考关系与 QP 热力图
 - AV1 解析 OBU header、Sequence Header、Frame Header / Frame OBU、Tile Group 与 Metadata OBU，显示 profile/level、位深、色度采样、Superblock 尺寸、Order Hint、reference slots 和 `refresh_frame_flags`
 - AV1 通过 libaom inspection 按需导出真实 Coding Block；支持 4×4 到 128×128 及 4×8、8×4、16×64、64×16 等非方形块，显示 Y/UV 预测模式、变换尺寸/类型、块级 QIndex、Segment、Skip、IntraBC、参考帧和运动矢量，并提供 QIndex 热力图与当前帧统计
-- AV1 块分析采用“画面预览优先”：滚动列表只加载缩略图，选中帧预览完成后才以较低系统优先级分析当前帧；大体积 inspection JSON 在后台线程解析，不阻塞界面
-- H.265 通过参考解码器按需导出 CTU 内部四叉树；独立的“CTU / CU”页面显示每个叶子 CU 的编码尺寸、深度、分区模式、预测类别、QP 和近似 CABAC 字节数；大分辨率码流在展开 CTU 时才加载明细
+- AV1 与 H.265 块分析采用“画面预览优先”：先加载当前帧和可见列表缩略图，预览队列空闲后才以较低系统优先级分析选中帧、再补可见帧；AV1 只序列化目标范围的 inspection JSON，并在后台线程整理，不阻塞界面
+- H.265 通过参考解码器按需导出 CTU 内部四叉树；独立的“CTU / CU”页面显示每个叶子 CU 的编码尺寸、深度、分区模式、预测类别、QP 和近似 CABAC 字节数
 - MP4 / MOV 中的 H.264、H.265、MPEG-4 Part 2 和 AV1 视频轨道，支持解析采样表、长度前缀 NAL、`mp4v/esds` 与 `av01/av1C`；“文件视图”按层级显示 ISO BMFF Box、偏移、大小、关键字段和 Hex
 - 独立区分 IDR、普通 I、I/P 混合 Slice，以及完整帧、多 Slice 分片帧和起始分片缺失
 - 每帧 Slice 清单及 Slice Header 字段级解析

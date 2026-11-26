@@ -13,6 +13,7 @@ namespace bitscope {
 
 struct Av1BlockParseResult {
     QVector<QVector<Av1CodingBlockInfo>> frames;
+    QVector<int> inputFrames;
     QString error;
 };
 
@@ -57,9 +58,12 @@ private:
     QVector<int> m_parseRequested;
     int m_activeStart = 0;
     int m_activeEnd = 0;
+    int m_activeOutputStart = 0;
     int m_parseStart = 0;
     int m_parseEnd = 0;
+    int m_parseOutputStart = 0;
     int m_job = 0;
+    int m_priorityFrame = -1;
     int m_generation = 0;
     int m_parseGeneration = 0;
     QString m_activeInput;

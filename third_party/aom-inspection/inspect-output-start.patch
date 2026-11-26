@@ -1,0 +1,71 @@
+diff --git a/examples/inspect.c b/examples/inspect.c
+index 9042eb8..8aac782 100644
+--- a/examples/inspect.c
++++ b/examples/inspect.c
+@@ -71,10 +71,14 @@ typedef enum {
+ static LayerType layers = 0;
+ 
+ static int stop_after = 0;
++static int output_start = 0;
++static int input_frame_index = -1;
+ static int compress = 0;
+ 
+ static const arg_def_t limit_arg =
+     ARG_DEF(NULL, "limit", 1, "Stop decoding after n frames");
++static const arg_def_t output_start_arg = ARG_DEF(
++    NULL, "output-start", 1, "Decode but do not dump frames before n");
+ static const arg_def_t dump_all_arg = ARG_DEF("A", "all", 0, "Dump All");
+ static const arg_def_t compress_arg =
+     ARG_DEF("x", "compress", 0, "Compress JSON using RLE");
+@@ -125,6 +129,7 @@ int combined_parm_list[15];
+ int combined_parm_count = 0;
+ 
+ static const arg_def_t *main_args[] = { &limit_arg,
++                                        &output_start_arg,
+                                         &dump_all_arg,
+                                         &compress_arg,
+ #if CONFIG_ACCOUNTING
+@@ -619,6 +624,9 @@ static void inspect(void *pbi, void *data) {
+   // There's no information to show.
+   if (frame_data.show_existing_frame) return;
+ 
++  decoded_frame_count++;
++  if (input_frame_index < output_start) return;
++
+   (void)data;
+   // We allocate enough space and hope we don't write out of bounds. Totally
+   // unsafe but this speeds things up, especially when compiled to Javascript.
+@@ -716,6 +724,8 @@ static void inspect(void *pbi, void *data) {
+ #endif
+   buf +=
+       snprintf(buf, MAX_BUFFER, "  \"frame\": %d,\n", frame_data.frame_number);
++  buf += snprintf(buf, MAX_BUFFER, "  \"inputFrame\": %d,\n",
++                  input_frame_index);
+   buf += snprintf(buf, MAX_BUFFER, "  \"showFrame\": %d,\n",
+                   frame_data.show_frame);
+   buf += snprintf(buf, MAX_BUFFER, "  \"frameType\": %d,\n",
+@@ -736,7 +746,6 @@ static void inspect(void *pbi, void *data) {
+   buf += put_str(buf, "  \"configString\": \"");
+   buf += put_str_with_escape(buf, aom_codec_build_config());
+   buf += put_str(buf, "\"\n");
+-  decoded_frame_count++;
+   buf += put_str(buf, "},\n");
+   *(buf++) = 0;
+   on_frame_decoded_dump(buffer);
+@@ -789,6 +798,7 @@ int read_frame(void) {
+   do {
+     if (!have_frame) {
+       if (!aom_video_reader_read_frame(reader)) return EXIT_FAILURE;
++      ++input_frame_index;
+       frame = aom_video_reader_get_frame(reader, &frame_size);
+ 
+       have_frame = 1;
+@@ -936,6 +946,8 @@ static void parse_args(char **argv) {
+       usage_exit();
+     else if (arg_match(&arg, &limit_arg, argi))
+       stop_after = arg_parse_uint(&arg);
++    else if (arg_match(&arg, &output_start_arg, argi))
++      output_start = arg_parse_uint(&arg);
+     else if (arg_match(&arg, &skip_non_transform_arg, argi))
+       skip_non_transform = arg_parse_uint(&arg);
+     else if (arg_match(&arg, &combined_arg, argi))

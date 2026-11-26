@@ -122,6 +122,7 @@ void HevcCuProvider::setStream(StreamPtr stream)
     m_cached.clear();
     m_failed.clear();
     m_activeRequested.clear();
+    m_priorityFrame = -1;
 }
 
 QString HevcCuProvider::decoderPath() const
@@ -154,6 +155,8 @@ QString HevcCuProvider::decoderPath() const
 
 void HevcCuProvider::requestFrame(int frameIndex)
 {
+    m_pending.clear();
+    m_priorityFrame = frameIndex;
     requestRange(frameIndex, frameIndex);
 }
 
@@ -232,7 +235,9 @@ void HevcCuProvider::processQueue()
 
     QList<int> sorted = m_pending.values();
     std::sort(sorted.begin(), sorted.end());
-    const int anchor = sorted.first();
+    const int anchor = m_pending.contains(m_priorityFrame)
+        ? m_priorityFrame : sorted.first();
+    m_priorityFrame = -1;
     m_activeStart = nearestStart(anchor);
     m_activeEnd = anchor;
     m_activeRequested.clear();
@@ -264,7 +269,18 @@ void HevcCuProvider::processQueue()
     m_process.setWorkingDirectory(m_activeDirectory);
     Q_EMIT statusChanged(QStringLiteral("正在解析 HEVC CTU/CU 四叉树 F%1–F%2")
                              .arg(m_activeStart).arg(m_activeEnd));
-    m_process.start(executable, {QStringLiteral("-b"), m_activeInput});
+    QString program = executable;
+    QStringList arguments{QStringLiteral("-b"), m_activeInput};
+#ifndef Q_OS_WIN
+    const QString nice = QStandardPaths::findExecutable(QStringLiteral("nice"));
+    if (!nice.isEmpty()) {
+        arguments.prepend(executable);
+        arguments.prepend(QStringLiteral("10"));
+        arguments.prepend(QStringLiteral("-n"));
+        program = nice;
+    }
+#endif
+    m_process.start(program, arguments);
 }
 
 QVector<QVector<HevcCodingUnitInfo>> HevcCuProvider::parseOutput(QString *error) const

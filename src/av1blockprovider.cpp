@@ -144,6 +144,7 @@ void Av1BlockProvider::setStream(StreamPtr stream)
     m_cached.clear();
     m_failed.clear();
     m_activeRequested.clear();
+    m_priorityFrame = -1;
 }
 
 QString Av1BlockProvider::analyzerPath() const
@@ -177,6 +178,7 @@ QString Av1BlockProvider::analyzerPath() const
 void Av1BlockProvider::requestFrame(int frameIndex)
 {
     m_pending.clear();
+    m_priorityFrame = frameIndex;
     requestRange(frameIndex, frameIndex);
 }
 
@@ -277,9 +279,12 @@ void Av1BlockProvider::processQueue()
 
     QList<int> sorted = m_pending.values();
     std::sort(sorted.begin(), sorted.end());
-    const int anchor = sorted.first();
+    const int anchor = m_pending.contains(m_priorityFrame)
+        ? m_priorityFrame : sorted.first();
+    m_priorityFrame = -1;
     m_activeStart = nearestStart(anchor);
     m_activeEnd = anchor;
+    m_activeOutputStart = anchor - m_activeStart;
     m_activeRequested.clear();
     for (int index : sorted) {
         if (nearestStart(index) == m_activeStart && index <= anchor + 12) {
@@ -307,10 +312,9 @@ void Av1BlockProvider::processQueue()
     }
     input.write(ivfSegment(m_activeStart, m_activeEnd));
     input.close();
-
     const QStringList arguments{
         m_activeInput,
-        QStringLiteral("--limit=%1").arg(m_activeEnd - m_activeStart + 1),
+        QStringLiteral("--output-start=%1").arg(m_activeOutputStart),
         QStringLiteral("--blockSize"), QStringLiteral("--mode"),
         QStringLiteral("--uv_mode"), QStringLiteral("--transformSize"),
         QStringLiteral("--transformType"), QStringLiteral("--delta_q"),
@@ -354,6 +358,7 @@ Av1BlockParseResult Av1BlockProvider::parseOutput(const QByteArray &data,
         if (!frameValue.isObject())
             continue;
         const QJsonObject object = frameValue.toObject();
+        result.inputFrames.push_back(object.value(QStringLiteral("inputFrame")).toInt(-1));
         const auto blockNames = inverseMap(object.value(QStringLiteral("blockSizeMap")).toObject());
         const auto modeNames = inverseMap(object.value(QStringLiteral("modeMap")).toObject());
         const auto uvModeNames = inverseMap(object.value(QStringLiteral("uv_modeMap")).toObject());
@@ -466,6 +471,7 @@ void Av1BlockProvider::processFinished(int exitCode, QProcess::ExitStatus status
     m_parseRequested = m_activeRequested;
     m_parseStart = m_activeStart;
     m_parseEnd = m_activeEnd;
+    m_parseOutputStart = m_activeOutputStart;
     m_parseGeneration = m_generation;
     const StreamPtr stream = m_stream;
     clearActiveFiles();
@@ -481,17 +487,56 @@ void Av1BlockProvider::parseFinished()
     const Av1BlockParseResult result = m_parseWatcher.result();
     if (m_parseGeneration == m_generation && m_stream
         && m_parseStart >= 0 && m_parseEnd < m_stream->frames.size()) {
-        QVector<int> decodedFrameIndices;
-        for (int index = m_parseStart; index <= m_parseEnd; ++index) {
-            if (m_stream->frames.at(index).displayType != QStringLiteral("SHOW_EXISTING"))
-                decodedFrameIndices.push_back(index);
-        }
-        for (int relative = 0; relative < result.frames.size()
-             && relative < decodedFrameIndices.size(); ++relative) {
-            const int frameIndex = decodedFrameIndices.at(relative);
-            if (!result.frames.at(relative).isEmpty()) {
-                m_cached.insert(frameIndex);
-                Q_EMIT codingBlocksReady(frameIndex, result.frames.at(relative));
+        const bool hasInputFrameMapping = result.inputFrames.size() == result.frames.size()
+            && std::all_of(result.inputFrames.cbegin(), result.inputFrames.cend(),
+                           [](int index) { return index >= 0; });
+        if (hasInputFrameMapping) {
+            // AV1 may output more than one decoded picture for a single input
+            // packet (hidden reference pictures followed by the shown picture).
+            // Keep the final callback for that packet: it is the picture the
+            // frame row and preview represent.
+            QHash<int, int> lastResultForFrame;
+            for (int relative = 0; relative < result.frames.size(); ++relative) {
+                const int frameIndex = m_parseStart + result.inputFrames.at(relative);
+                if (frameIndex >= m_parseStart && frameIndex <= m_parseEnd
+                    && m_stream->frames.at(frameIndex).displayType
+                        != QStringLiteral("SHOW_EXISTING"))
+                    lastResultForFrame.insert(frameIndex, relative);
+            }
+            for (auto it = lastResultForFrame.constBegin();
+                 it != lastResultForFrame.constEnd(); ++it) {
+                const auto &blocks = result.frames.at(it.value());
+                if (!blocks.isEmpty()) {
+                    m_cached.insert(it.key());
+                    Q_EMIT codingBlocksReady(it.key(), blocks);
+                }
+            }
+        } else {
+            // Backward compatibility for an official/unpatched inspection
+            // helper, which has no inputFrame field and emits sequential JSON.
+            QVector<int> decodedFrameIndices;
+            for (int index = m_parseStart; index <= m_parseEnd; ++index) {
+                if (m_stream->frames.at(index).displayType != QStringLiteral("SHOW_EXISTING"))
+                    decodedFrameIndices.push_back(index);
+            }
+            int filteredOutputStart = 0;
+            const int firstOutputFrame = m_parseStart + m_parseOutputStart;
+            for (int index : decodedFrameIndices) {
+                if (index >= firstOutputFrame)
+                    break;
+                ++filteredOutputStart;
+            }
+            const int expectedFilteredFrames = std::max(
+                0, int(decodedFrameIndices.size()) - filteredOutputStart);
+            const int mappingOffset = result.frames.size() > expectedFilteredFrames
+                ? 0 : filteredOutputStart;
+            for (int relative = 0; relative < result.frames.size()
+                 && relative + mappingOffset < decodedFrameIndices.size(); ++relative) {
+                const int frameIndex = decodedFrameIndices.at(relative + mappingOffset);
+                if (!result.frames.at(relative).isEmpty()) {
+                    m_cached.insert(frameIndex);
+                    Q_EMIT codingBlocksReady(frameIndex, result.frames.at(relative));
+                }
             }
         }
         for (int index : m_parseRequested) {

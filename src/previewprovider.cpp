@@ -22,7 +22,7 @@ PreviewProvider::PreviewProvider(QObject *parent) : QObject(parent) {
 
 PreviewProvider::~PreviewProvider(){if(m_process.state()!=QProcess::NotRunning){m_process.kill();m_process.waitForFinished(1000);}}
 
-void PreviewProvider::setStream(StreamPtr stream){if(m_process.state()!=QProcess::NotRunning){m_process.kill();m_process.waitForFinished(1000);}m_stream=std::move(stream);m_pending.clear();m_cached.clear();m_failed.clear();m_activeRequested.clear();m_activeOutputOrder.clear();clearActiveFiles();}
+void PreviewProvider::setStream(StreamPtr stream){if(m_process.state()!=QProcess::NotRunning){m_process.kill();m_process.waitForFinished(1000);}m_stream=std::move(stream);m_pending.clear();m_cached.clear();m_failed.clear();m_activeRequested.clear();m_activeOutputOrder.clear();m_priorityFrame=-1;clearActiveFiles();}
 
 namespace {
 
@@ -76,8 +76,9 @@ QString PreviewProvider::ffmpegPath() const {
     return QStandardPaths::findExecutable(name);
 }
 
-void PreviewProvider::requestFrame(int frameIndex){requestRange(frameIndex,frameIndex);}
+void PreviewProvider::requestFrame(int frameIndex){m_pending.clear();m_priorityFrame=frameIndex;requestRange(frameIndex,frameIndex);}
 void PreviewProvider::forgetFrame(int frameIndex){m_cached.remove(frameIndex);}
+bool PreviewProvider::isIdle() const{return m_pending.isEmpty()&&m_process.state()==QProcess::NotRunning&&!m_queueTimer.isActive();}
 
 void PreviewProvider::requestRange(int first,int last){if(!m_stream||m_stream->frames.isEmpty())return;const int finalFrame=int(m_stream->frames.size())-1;first=std::clamp(first,0,finalFrame);last=std::clamp(last,first,finalFrame);for(int i=first;i<=last;++i)if(!m_cached.contains(i)&&!m_failed.contains(i))m_pending.insert(i);if(!m_pending.isEmpty()&&m_process.state()==QProcess::NotRunning)m_queueTimer.start();}
 
@@ -109,13 +110,13 @@ QByteArray PreviewProvider::accessUnit(int frameIndex,bool includeParameters) co
 
 QByteArray PreviewProvider::segment(int first,int last) const {QByteArray out;for(int i=first;i<=last;++i)out.append(accessUnit(i,i==first));return out;}
 
-void PreviewProvider::processQueue(){if(!m_stream||m_pending.isEmpty()||m_process.state()!=QProcess::NotRunning)return;const QString executable=ffmpegPath();if(executable.isEmpty()){const auto pending=m_pending;m_pending.clear();const QString reason=QStringLiteral("未找到 FFmpeg。macOS 可执行 brew install ffmpeg；也可把 ffmpeg 放到应用旁边，或设置 BITSCOPE_FFMPEG。 ");for(int i:pending){m_failed.insert(i);Q_EMIT previewFailed(i,reason);}Q_EMIT statusChanged(QStringLiteral("预览不可用：未找到 FFmpeg（码流分析不受影响）"));return;}
-    QList<int> sorted=m_pending.values();std::sort(sorted.begin(),sorted.end());const int anchor=sorted.first();m_activeStart=nearestStart(anchor);m_activeRequested.clear();m_activeEnd=anchor;
+void PreviewProvider::processQueue(){if(!m_stream||m_pending.isEmpty()||m_process.state()!=QProcess::NotRunning)return;const QString executable=ffmpegPath();if(executable.isEmpty()){const auto pending=m_pending;m_pending.clear();const QString reason=QStringLiteral("未找到 FFmpeg。macOS 可执行 brew install ffmpeg；也可把 ffmpeg 放到应用旁边，或设置 BITSCOPE_FFMPEG。 ");for(int i:pending){m_failed.insert(i);Q_EMIT previewFailed(i,reason);}Q_EMIT statusChanged(QStringLiteral("预览不可用：未找到 FFmpeg（码流分析不受影响）"));Q_EMIT queueIdle();return;}
+    QList<int> sorted=m_pending.values();std::sort(sorted.begin(),sorted.end());const int anchor=m_pending.contains(m_priorityFrame)?m_priorityFrame:sorted.first();m_priorityFrame=-1;m_activeStart=nearestStart(anchor);m_activeRequested.clear();m_activeEnd=anchor;
     for(int index:sorted){if(nearestStart(index)==m_activeStart&&index<=anchor+64){m_activeRequested.push_back(index);m_activeEnd=std::max(m_activeEnd,index);}}
     for(int index:m_activeRequested)m_pending.remove(index);
     m_activeOutputOrder.clear();for(int index=m_activeStart;index<=m_activeEnd;++index)m_activeOutputOrder.push_back(index);if(m_stream->codec==Codec::Mpeg4Visual)std::stable_sort(m_activeOutputOrder.begin(),m_activeOutputOrder.end(),[this](int a,int b){return m_stream->frames.at(a).pts<m_stream->frames.at(b).pts;});
     const QString suffix=m_stream->codec==Codec::Avc?QStringLiteral("h264"):(m_stream->codec==Codec::Hevc?QStringLiteral("h265"):(m_stream->codec==Codec::Mpeg4Visual?QStringLiteral("m4v"):QStringLiteral("obu")));
-    const int job=m_job++;m_activePrefix=QDir(m_temp.path()).filePath(QStringLiteral("preview_%1_").arg(job));m_activeInput=QDir(m_temp.path()).filePath(QStringLiteral("preview_%1.%2").arg(job).arg(suffix));QFile input(m_activeInput);if(!input.open(QIODevice::WriteOnly)){for(int index:m_activeRequested)Q_EMIT previewFailed(index,input.errorString());m_queueTimer.start();return;}input.write(segment(m_activeStart,m_activeEnd));input.close();
+    const int job=m_job++;m_activePrefix=QDir(m_temp.path()).filePath(QStringLiteral("preview_%1_").arg(job));m_activeInput=QDir(m_temp.path()).filePath(QStringLiteral("preview_%1.%2").arg(job).arg(suffix));QFile input(m_activeInput);if(!input.open(QIODevice::WriteOnly)){for(int index:m_activeRequested)Q_EMIT previewFailed(index,input.errorString());if(!m_pending.isEmpty())m_queueTimer.start();else Q_EMIT queueIdle();return;}input.write(segment(m_activeStart,m_activeEnd));input.close();
     const QString output=m_activePrefix+QStringLiteral("%05d.jpg");const QString fps=QString::number(m_stream->fps,'f',3);
     const bool macroblockDebug=m_stream->codec==Codec::Avc||m_stream->codec==Codec::Mpeg4Visual;
     QStringList args{QStringLiteral("-hide_banner"),QStringLiteral("-loglevel"),macroblockDebug?QStringLiteral("debug"):QStringLiteral("error")};
@@ -179,6 +180,8 @@ void PreviewProvider::processFinished(int exitCode, QProcess::ExitStatus status)
         : QStringLiteral("等待生成 %1 帧预览").arg(m_pending.size()));
     if (!m_pending.isEmpty())
         m_queueTimer.start();
+    else
+        Q_EMIT queueIdle();
 }
 
 QVector<QVector<DecodedUnitInfo>> PreviewProvider::parseAvcDecodedUnits(const QByteArray &log,

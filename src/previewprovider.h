@@ -20,6 +20,7 @@ public:
     void requestRange(int first, int last);
     void forgetFrame(int frameIndex);
     QString ffmpegPath() const;
+    bool isIdle() const;
 
 Q_SIGNALS:
     void thumbnailReady(int frameIndex, const QImage &image);
@@ -27,6 +28,7 @@ Q_SIGNALS:
     void decodedUnitsUnavailable(int frameIndex, const QString &reason);
     void statusChanged(const QString &status);
     void previewFailed(int frameIndex, const QString &reason);
+    void queueIdle();
 
 private Q_SLOTS:
     void processQueue();
@@ -51,6 +53,7 @@ private:
     QVector<int> m_activeOutputOrder;
     int m_activeStart = 0;
     int m_activeEnd = 0;
+    int m_priorityFrame = -1;
     int m_job = 0;
     QString m_activeInput;
     QString m_activePrefix;
