@@ -294,8 +294,8 @@ void Av1BlockProvider::processQueue()
 
     QList<int> sorted = m_pending.values();
     std::sort(sorted.begin(), sorted.end());
-    const int anchor = m_pending.contains(m_priorityFrame)
-        ? m_priorityFrame : sorted.first();
+    m_activeInteractive = m_pending.contains(m_priorityFrame);
+    const int anchor = m_activeInteractive ? m_priorityFrame : sorted.first();
     m_priorityFrame = -1;
     m_activeStart = nearestStart(anchor);
     m_activeEnd = anchor;
@@ -338,13 +338,16 @@ void Av1BlockProvider::processQueue()
         QStringLiteral("--intrabc"), QStringLiteral("--compress")
     };
     m_process.setWorkingDirectory(m_activeDirectory);
-    Q_EMIT statusChanged(QStringLiteral("正在解析 AV1 Superblock/Coding Block F%1–F%2")
-                             .arg(m_activeStart).arg(m_activeEnd));
+    Q_EMIT statusChanged(m_activeInteractive
+        ? QStringLiteral("Superblock 根网格已显示 · 正在解码参考链 F%1→F%2，补充当前帧块明细")
+              .arg(m_activeStart).arg(anchor)
+        : QStringLiteral("正在后台补充 AV1 块明细 F%1–F%2")
+              .arg(anchor).arg(m_activeEnd));
     QString program = executable;
     QStringList processArguments = arguments;
 #ifndef Q_OS_WIN
     const QString nice = QStandardPaths::findExecutable(QStringLiteral("nice"));
-    if (!nice.isEmpty()) {
+    if (!m_activeInteractive && !nice.isEmpty()) {
         processArguments.prepend(executable);
         processArguments.prepend(QStringLiteral("10"));
         processArguments.prepend(QStringLiteral("-n"));

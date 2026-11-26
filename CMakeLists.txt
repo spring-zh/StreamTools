@@ -131,4 +131,17 @@ if(BITSCOPE_BUILD_TESTS)
     target_include_directories(BitScopeAv1BlockSmoke PRIVATE src)
     target_link_libraries(BitScopeAv1BlockSmoke PRIVATE Qt6::Core Qt6::Gui Qt6::Concurrent)
     target_compile_definitions(BitScopeAv1BlockSmoke PRIVATE QT_NO_KEYWORDS)
+
+    qt_add_executable(BitScopeHevcCuSmoke
+        tests/hevccuprovider_smoke.cpp
+        src/bitstreamtypes.h
+        src/bitreader.h
+        src/bitstreamparser.h
+        src/bitstreamparser.cpp
+        src/hevccuprovider.h
+        src/hevccuprovider.cpp
+    )
+    target_include_directories(BitScopeHevcCuSmoke PRIVATE src)
+    target_link_libraries(BitScopeHevcCuSmoke PRIVATE Qt6::Core Qt6::Gui)
+    target_compile_definitions(BitScopeHevcCuSmoke PRIVATE QT_NO_KEYWORDS)
 endif()

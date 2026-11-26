@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QStandardPaths>
 
@@ -248,8 +249,8 @@ void HevcCuProvider::processQueue()
 
     QList<int> sorted = m_pending.values();
     std::sort(sorted.begin(), sorted.end());
-    const int anchor = m_pending.contains(m_priorityFrame)
-        ? m_priorityFrame : sorted.first();
+    m_activeInteractive = m_pending.contains(m_priorityFrame);
+    const int anchor = m_activeInteractive ? m_priorityFrame : sorted.first();
     m_priorityFrame = -1;
     m_activeStart = nearestStart(anchor);
     m_activeEnd = anchor;
@@ -279,14 +280,26 @@ void HevcCuProvider::processQueue()
     input.write(segment(m_activeStart, m_activeEnd));
     input.close();
 
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    QStringList outputFrames;
+    for (int index : m_activeRequested)
+        outputFrames.push_back(QString::number(index - m_activeStart));
+    m_activeOutputFiltered = !outputFrames.isEmpty();
+    environment.insert(QStringLiteral("BITSCOPE_HEVC_OUTPUT_FRAMES"),
+                       outputFrames.join(QLatin1Char(',')));
+    m_process.setProcessEnvironment(environment);
+
     m_process.setWorkingDirectory(m_activeDirectory);
-    Q_EMIT statusChanged(QStringLiteral("正在解析 HEVC CTU/CU 四叉树 F%1–F%2")
-                             .arg(m_activeStart).arg(m_activeEnd));
+    Q_EMIT statusChanged(m_activeInteractive
+        ? QStringLiteral("CTU 根网格已显示 · 正在解码参考链 F%1→F%2，补充当前帧 CU 明细")
+              .arg(m_activeStart).arg(anchor)
+        : QStringLiteral("正在后台补充 HEVC CU 明细 F%1–F%2")
+              .arg(anchor).arg(m_activeEnd));
     QString program = executable;
     QStringList arguments{QStringLiteral("-b"), m_activeInput};
 #ifndef Q_OS_WIN
     const QString nice = QStandardPaths::findExecutable(QStringLiteral("nice"));
-    if (!nice.isEmpty()) {
+    if (!m_activeInteractive && !nice.isEmpty()) {
         arguments.prepend(executable);
         arguments.prepend(QStringLiteral("10"));
         arguments.prepend(QStringLiteral("-n"));
@@ -296,9 +309,9 @@ void HevcCuProvider::processQueue()
     m_process.start(program, arguments);
 }
 
-QVector<QVector<HevcCodingUnitInfo>> HevcCuProvider::parseOutput(QString *error) const
+HevcCuParseResult HevcCuProvider::parseOutput(QString *error) const
 {
-    QVector<QVector<HevcCodingUnitInfo>> frames;
+    HevcCuParseResult result;
     const QVector<AnalyzerRecord> treeRecords = readRecords(
         QDir(m_activeDirectory).filePath(QStringLiteral("decoder_cupu.txt")));
     const QVector<AnalyzerRecord> predictionRecords = readRecords(
@@ -310,7 +323,7 @@ QVector<QVector<HevcCodingUnitInfo>> HevcCuProvider::parseOutput(QString *error)
     if (treeRecords.isEmpty()) {
         if (error)
             *error = QStringLiteral("参考解码器没有输出 decoder_cupu.txt");
-        return frames;
+        return result;
     }
 
     int currentPoc = 0;
@@ -319,7 +332,8 @@ QVector<QVector<HevcCodingUnitInfo>> HevcCuProvider::parseOutput(QString *error)
     for (int recordIndex = 0; recordIndex < treeRecords.size(); ++recordIndex) {
         const AnalyzerRecord &tree = treeRecords.at(recordIndex);
         if (frameGroup < 0 || tree.poc != currentPoc || addresses.contains(tree.ctuAddress)) {
-            frames.push_back({});
+            result.frames.push_back({});
+            result.pocs.push_back(tree.poc);
             ++frameGroup;
             currentPoc = tree.poc;
             addresses.clear();
@@ -378,11 +392,11 @@ QVector<QVector<HevcCodingUnitInfo>> HevcCuProvider::parseOutput(QString *error)
             unit.prediction = prediction;
             unit.qp = qp;
             unit.approximateBytes = approximateBytes;
-            frames[frameGroup].push_back(std::move(unit));
+            result.frames[frameGroup].push_back(std::move(unit));
         };
         parseNode(rootX, rootY, ctuSize, 0);
     }
-    return frames;
+    return result;
 }
 
 void HevcCuProvider::processFinished(int exitCode, QProcess::ExitStatus status)
@@ -405,13 +419,30 @@ void HevcCuProvider::processFinished(int exitCode, QProcess::ExitStatus status)
         }
     } else {
         QString parseError;
-        const auto frames = parseOutput(&parseError);
-        for (int relative = 0; relative < frames.size()
-             && m_activeStart + relative <= m_activeEnd; ++relative) {
-            const int frameIndex = m_activeStart + relative;
-            if (!frames.at(relative).isEmpty()) {
+        const auto result = parseOutput(&parseError);
+        const bool filteredOutput = m_activeOutputFiltered
+            && result.frames.size() <= m_activeRequested.size();
+        const bool mapByPoc = !filteredOutput && result.frames.size() == result.pocs.size()
+            && std::all_of(m_activeRequested.cbegin(), m_activeRequested.cend(),
+                           [this](int index) { return m_stream->frames.at(index).poc >= 0; });
+        for (int relative = 0; relative < result.frames.size(); ++relative) {
+            int frameIndex = m_activeStart + relative;
+            if (filteredOutput) {
+                frameIndex = relative < m_activeRequested.size()
+                    ? m_activeRequested.at(relative) : -1;
+            } else if (mapByPoc) {
+                frameIndex = -1;
+                for (int index = m_activeStart; index <= m_activeEnd; ++index) {
+                    if (m_stream->frames.at(index).poc == result.pocs.at(relative)) {
+                        frameIndex = index;
+                        break;
+                    }
+                }
+            }
+            if (frameIndex >= m_activeStart && frameIndex <= m_activeEnd
+                && !result.frames.at(relative).isEmpty()) {
                 m_cached.insert(frameIndex);
-                Q_EMIT codingUnitsReady(frameIndex, frames.at(relative));
+                Q_EMIT codingUnitsReady(frameIndex, result.frames.at(relative));
             }
         }
         for (int index : m_activeRequested) {

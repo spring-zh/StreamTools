@@ -64,6 +64,7 @@ private:
     int m_parseOutputStart = 0;
     int m_job = 0;
     int m_priorityFrame = -1;
+    bool m_activeInteractive = false;
     bool m_cancelled = false;
     int m_generation = 0;
     int m_parseGeneration = 0;

@@ -1103,8 +1103,19 @@ void MainWindow::updateFrameStatistics(int frameIndex)
     const int totalUnits = frame.unitColumns * frame.unitRows;
     if (m_stream->codec == Codec::Hevc) {
         if (!frame.hevcCodingUnitsReady) {
+            int dependencyStart = 0;
+            for (int index = frameIndex; index >= 0; --index) {
+                const FrameInfo &candidate = m_stream->frames.at(index);
+                if (candidate.randomAccess
+                    || (candidate.recoveryPoint
+                        && index + std::max(0, candidate.recoveryFrameCount) <= frameIndex)) {
+                    dependencyStart = index;
+                    break;
+                }
+            }
             const QString state = frame.hevcCodingUnitsError.isEmpty()
-                ? QStringLiteral("正在通过 HEVC 参考解码器解析实际 CU 四叉树…")
+                ? QStringLiteral("CTU 根网格和 Slice 范围已就绪；正在从 F%1 连续解码 %2 帧，补充叶子 CU、QP 和预测信息…")
+                      .arg(dependencyStart).arg(frameIndex - dependencyStart + 1)
                 : frame.hevcCodingUnitsError.toHtmlEscaped();
             m_frameStats->setText(
                 QStringLiteral("<b>当前帧 F%1</b>　CTU %2（%3 × %4）　最大尺寸 %5×%5　Slice %6<br>"

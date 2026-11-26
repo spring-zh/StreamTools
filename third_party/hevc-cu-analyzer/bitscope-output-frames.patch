@@ -1,0 +1,55 @@
+diff --git a/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.cpp b/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.cpp
+--- a/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.cpp
++++ b/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.cpp
+@@ -1,2 +1,4 @@
+ #include "TSysuAnalyzerOutput.h"
++#include <cstdlib>
++#include <sstream>
+ 
+@@ -17,0 +21,1 @@
++  m_cQPOutput.open      ("decoder_qp.txt",       ios::out);
+@@ -24,0 +29,16 @@
++  m_iPictureIndex = -1;
++  const char* pchOutputFrames = std::getenv("BITSCOPE_HEVC_OUTPUT_FRAMES");
++  if( pchOutputFrames != NULL )
++  {
++    std::stringstream cFrameStream( pchOutputFrames );
++    Int iFrame = 0;
++    while( cFrameStream >> iFrame )
++    {
++      m_aiOutputFrames.insert( iFrame );
++      if( cFrameStream.peek() == ',' )
++      {
++        cFrameStream.ignore();
++      }
++    }
++  }
++
+@@ -27,0 +50,6 @@
++Bool TSysuAnalyzerOutput::shouldWriteFrame( TComDataCU* pcCU )
++{
++  if( pcCU->getCtuRsAddr() == 0 ) ++m_iPictureIndex;
++  return m_aiOutputFrames.empty() || m_aiOutputFrames.find( m_iPictureIndex ) != m_aiOutputFrames.end();
++}
++
+@@ -65,0 +95,1 @@
++  if( !shouldWriteFrame( pcCU ) ) return;
+@@ -77,0 +107,1 @@
++  m_cQPOutput << "<" << iPoc << "," << iAddr << ">" << " ";
+@@ -92,0 +123,1 @@
++  m_cQPOutput << endl;
+@@ -108,0 +140,1 @@
++    m_cQPOutput << (puhPartSize[iOffset] == NUMBER_OF_PART_SIZES ? -1 : pcCU->getQP(iOffset)) << " ";
+diff --git a/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.h b/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.h
+--- a/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.h
++++ b/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.h
+@@ -11,0 +12,1 @@
++#include <set>
+@@ -83,0 +85,2 @@
++  Bool shouldWriteFrame ( TComDataCU* pcCU );
++
+@@ -94,0 +98,1 @@
++  std::ofstream m_cQPOutput;
+@@ -108,0 +113,2 @@
++  std::set<Int>       m_aiOutputFrames;
++  Int                 m_iPictureIndex;

@@ -10,6 +10,11 @@
 
 namespace bitscope {
 
+struct HevcCuParseResult {
+    QVector<QVector<HevcCodingUnitInfo>> frames;
+    QVector<int> pocs;
+};
+
 class HevcCuProvider final : public QObject {
     Q_OBJECT
 public:
@@ -34,7 +39,7 @@ private:
     int nearestStart(int frameIndex) const;
     QByteArray accessUnit(int frameIndex, bool includeParameters) const;
     QByteArray segment(int first, int last) const;
-    QVector<QVector<HevcCodingUnitInfo>> parseOutput(QString *error) const;
+    HevcCuParseResult parseOutput(QString *error) const;
     void clearActiveFiles();
 
     StreamPtr m_stream;
@@ -48,6 +53,8 @@ private:
     int m_activeEnd = 0;
     int m_job = 0;
     int m_priorityFrame = -1;
+    bool m_activeInteractive = false;
+    bool m_activeOutputFiltered = false;
     bool m_cancelled = false;
     QString m_activeInput;
     QString m_activeDirectory;
