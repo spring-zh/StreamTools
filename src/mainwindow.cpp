@@ -156,6 +156,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     connect(m_previews, &PreviewProvider::thumbnailReady, this, [this](int frame, const QImage &image) {
         m_model->setThumbnail(frame, image);
         m_macroView->setFrameImage(frame, image);
+        if (frame == m_currentFrame)
+            requestCurrentBlockData(frame);
     });
     connect(m_previews, &PreviewProvider::decodedUnitsReady, this,
             [this](int frameIndex, const QVector<DecodedUnitInfo> &units) {
@@ -186,8 +188,10 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     connect(m_previews, &PreviewProvider::statusChanged, m_status, &QLabel::setText);
     connect(m_previews, &PreviewProvider::previewFailed, this, [this](int frame, const QString &reason) {
         m_macroView->setFrameError(frame, reason.left(500));
-        if (m_table->currentIndex().data(FrameTableModel::ItemIndexRole).toInt() == frame)
+        if (m_table->currentIndex().data(FrameTableModel::ItemIndexRole).toInt() == frame) {
             m_status->setText(QStringLiteral("Frame %1 预览失败：%2").arg(frame).arg(reason.left(180)));
+            requestCurrentBlockData(frame);
+        }
     });
     connect(m_previews, &PreviewProvider::queueIdle,
             this, &MainWindow::requestVisibleBlockData);
@@ -203,6 +207,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
             m_macroView->refreshFrameData();
             updateFrameStatistics(frameIndex);
             updateCuTree(frameIndex);
+            if (m_previews->isIdle())
+                requestVisibleBlockData();
         }
     });
     connect(m_hevcCuProvider, &HevcCuProvider::codingUnitsUnavailable, this,
@@ -215,6 +221,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
             m_macroView->refreshFrameData();
             updateFrameStatistics(frameIndex);
             updateCuTree(frameIndex);
+            if (m_previews->isIdle())
+                requestVisibleBlockData();
         }
     });
     connect(m_hevcCuProvider, &HevcCuProvider::statusChanged, m_status, &QLabel::setText);
@@ -230,6 +238,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
             m_macroView->refreshFrameData();
             updateFrameStatistics(frameIndex);
             updateCuTree(frameIndex);
+            if (m_previews->isIdle())
+                requestVisibleBlockData();
         }
     });
     connect(m_av1BlockProvider, &Av1BlockProvider::codingBlocksUnavailable, this,
@@ -242,6 +252,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
             m_macroView->refreshFrameData();
             updateFrameStatistics(frameIndex);
             updateCuTree(frameIndex);
+            if (m_previews->isIdle())
+                requestVisibleBlockData();
         }
     });
     connect(m_av1BlockProvider, &Av1BlockProvider::statusChanged, m_status, &QLabel::setText);
@@ -830,8 +842,8 @@ void MainWindow::showFrame(int frameIndex) {
     const QImage cached = m_model->thumbnail(frameIndex);
     if (!cached.isNull()) m_macroView->setFrameImage(frameIndex, cached);
     if (cached.isNull()) m_previews->requestFrame(frameIndex);
-    if (!cached.isNull() && m_previews->isIdle())
-        requestVisibleBlockData();
+    else requestCurrentBlockData(frameIndex);
+    if (!cached.isNull() && m_previews->isIdle()) requestVisibleBlockData();
     m_timeline->setSelectedFrame(frameIndex);
     updateCuTree(frameIndex);
 
@@ -1031,6 +1043,12 @@ void MainWindow::requestVisibleBlockData()
         || m_currentFrame < 0 || m_mode->currentIndex() != 0
         || m_model->mode() != FrameTableModel::Mode::Frames || m_proxy->rowCount() == 0)
         return;
+    const FrameInfo &current = m_stream->frames.at(m_currentFrame);
+    const bool currentComplete = m_stream->codec == Codec::Av1
+        ? current.av1CodingBlocksReady || !current.av1CodingBlocksError.isEmpty()
+        : current.hevcCodingUnitsReady || !current.hevcCodingUnitsError.isEmpty();
+    if (!currentComplete)
+        return;
 
     int first = m_table->rowAt(0);
     int last = m_table->rowAt(std::max(0, m_table->viewport()->height() - 1));
@@ -1040,7 +1058,6 @@ void MainWindow::requestVisibleBlockData()
         last = std::min(m_proxy->rowCount() - 1, first + 10);
     QVector<int> visibleFrames;
     visibleFrames.reserve(last - first + 2);
-    visibleFrames.push_back(m_currentFrame);
     for (int row = first; row <= last; ++row) {
         const QModelIndex index = m_proxy->index(row, 0);
         if (!index.isValid())
@@ -1050,18 +1067,28 @@ void MainWindow::requestVisibleBlockData()
             visibleFrames.push_back(frame);
     }
 
+    for (int frame : visibleFrames) {
+        if (frame == m_currentFrame)
+            continue;
+        if (m_stream->codec == Codec::Av1)
+            m_av1BlockProvider->requestRange(frame, frame);
+        else
+            m_hevcCuProvider->requestRange(frame, frame);
+    }
+}
+
+void MainWindow::requestCurrentBlockData(int frameIndex)
+{
+    if (!m_stream || frameIndex != m_currentFrame || frameIndex < 0
+        || frameIndex >= m_stream->frames.size())
+        return;
+    const FrameInfo &frame = m_stream->frames.at(frameIndex);
     if (m_stream->codec == Codec::Av1) {
-        m_av1BlockProvider->requestFrame(m_currentFrame);
-        for (int frame : visibleFrames) {
-            if (frame != m_currentFrame)
-                m_av1BlockProvider->requestRange(frame, frame);
-        }
-    } else {
-        m_hevcCuProvider->requestFrame(m_currentFrame);
-        for (int frame : visibleFrames) {
-            if (frame != m_currentFrame)
-                m_hevcCuProvider->requestRange(frame, frame);
-        }
+        if (!frame.av1CodingBlocksReady && frame.av1CodingBlocksError.isEmpty())
+            m_av1BlockProvider->requestFrame(frameIndex);
+    } else if (m_stream->codec == Codec::Hevc) {
+        if (!frame.hevcCodingUnitsReady && frame.hevcCodingUnitsError.isEmpty())
+            m_hevcCuProvider->requestFrame(frameIndex);
     }
 }
 

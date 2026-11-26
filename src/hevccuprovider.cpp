@@ -113,8 +113,10 @@ HevcCuProvider::~HevcCuProvider()
 void HevcCuProvider::setStream(StreamPtr stream)
 {
     if (m_process.state() != QProcess::NotRunning) {
+        m_cancelled = true;
         m_process.kill();
         m_process.waitForFinished(1000);
+        m_cancelled = false;
     }
     clearActiveFiles();
     m_stream = std::move(stream);
@@ -156,7 +158,16 @@ QString HevcCuProvider::decoderPath() const
 void HevcCuProvider::requestFrame(int frameIndex)
 {
     m_pending.clear();
+    if (m_process.state() != QProcess::NotRunning
+        && m_activeRequested.size() == 1 && m_activeRequested.first() == frameIndex)
+        return;
     m_priorityFrame = frameIndex;
+    if (m_process.state() != QProcess::NotRunning
+        && (m_activeRequested.size() != 1 || m_activeRequested.first() != frameIndex)) {
+        m_cancelled = true;
+        m_process.kill();
+        m_activeRequested.clear();
+    }
     requestRange(frameIndex, frameIndex);
 }
 
@@ -168,6 +179,8 @@ void HevcCuProvider::requestRange(int first, int last)
     first = std::clamp(first, 0, finalFrame);
     last = std::clamp(last, first, finalFrame);
     for (int index = first; index <= last; ++index) {
+        if (m_process.state() != QProcess::NotRunning && m_activeRequested.contains(index))
+            continue;
         if (!m_cached.contains(index) && !m_failed.contains(index))
             m_pending.insert(index);
     }
@@ -374,6 +387,13 @@ QVector<QVector<HevcCodingUnitInfo>> HevcCuProvider::parseOutput(QString *error)
 
 void HevcCuProvider::processFinished(int exitCode, QProcess::ExitStatus status)
 {
+    if (m_cancelled) {
+        m_cancelled = false;
+        clearActiveFiles();
+        if (!m_pending.isEmpty())
+            m_queueTimer.start();
+        return;
+    }
     const QString processErrorText = QString::fromLocal8Bit(m_process.readAllStandardError()).trimmed();
     if (status != QProcess::NormalExit || exitCode != 0) {
         const QString reason = processErrorText.isEmpty()
@@ -415,6 +435,8 @@ void HevcCuProvider::processFinished(int exitCode, QProcess::ExitStatus status)
 
 void HevcCuProvider::processError(QProcess::ProcessError errorValue)
 {
+    if (m_cancelled)
+        return;
     if (errorValue == QProcess::Crashed || errorValue == QProcess::FailedToStart) {
         const QString reason = m_process.errorString();
         for (int index : m_activeRequested) {

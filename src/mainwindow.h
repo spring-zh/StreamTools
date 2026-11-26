@@ -53,6 +53,7 @@ private:
     void showFrame(int frameIndex);
     void showNal(int nalIndex);
     void updateVisiblePreviews();
+    void requestCurrentBlockData(int frameIndex);
     void requestVisibleBlockData();
     void updateMetrics();
     void updateFrameStatistics(int frameIndex);
