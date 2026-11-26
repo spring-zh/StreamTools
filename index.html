@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0b1017" />
+  <title>BitScope · H.264 / H.265 码流分析器</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div><strong>BitScope</strong><small>Stream Analyzer</small></div>
+      </div>
+      <div class="file-meta" id="fileMeta">
+        <span class="status-dot"></span>
+        <span id="fileName">内置演示流 · H.264</span>
+        <span class="meta-divider"></span>
+        <span id="fileSize">4.82 MB</span>
+      </div>
+      <div class="top-actions">
+        <button class="icon-btn" id="themeButton" title="切换显示密度" aria-label="切换显示密度">▦</button>
+        <button class="primary-button" id="openButton"><span>＋</span> 打开码流</button>
+        <input id="fileInput" type="file" accept=".h264,.264,.avc,.h265,.265,.hevc,.bin,.es" hidden />
+      </div>
+    </header>
+
+    <aside class="sidebar" aria-label="主导航">
+      <button class="nav-button active" data-view="stream" title="码流"><span>▤</span><small>码流</small></button>
+      <button class="nav-button" data-view="frames" title="帧"><span>◫</span><small>帧</small></button>
+      <button class="nav-button" data-view="params" title="参数集"><span>⌘</span><small>参数集</small></button>
+      <button class="nav-button" data-view="stats" title="统计"><span>⌁</span><small>统计</small></button>
+      <div class="sidebar-spacer"></div>
+      <button class="nav-button" id="helpButton" title="快捷说明"><span>?</span><small>帮助</small></button>
+    </aside>
+
+    <main class="main-content">
+      <section class="overview-bar">
+        <div class="stream-title">
+          <div class="codec-chip" id="codecChip">AVC</div>
+          <div>
+            <div class="title-line"><h1 id="streamTitle">H.264 / AVC 码流</h1><span class="live-badge">已解析</span></div>
+            <p id="streamSubtitle">High Profile · Level 4.1 · 1920 × 1080 · 29.97 fps</p>
+          </div>
+        </div>
+        <div class="metric-strip">
+          <div class="metric"><span>帧数</span><strong id="metricFrames">1,248</strong></div>
+          <div class="metric"><span>NAL 单元</span><strong id="metricNals">2,509</strong></div>
+          <div class="metric"><span>平均码率</span><strong id="metricBitrate">8.42 <em>Mb/s</em></strong></div>
+          <div class="metric"><span>时长</span><strong id="metricDuration">00:00:41.64</strong></div>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <div class="panel stream-panel">
+          <div class="panel-toolbar">
+            <div class="segmented" id="modeSegment">
+              <button class="active" data-mode="frames">帧视图</button>
+              <button data-mode="nals">NAL 视图</button>
+            </div>
+            <div class="filter-row">
+              <label class="search-box"><span>⌕</span><input id="searchInput" placeholder="搜索帧、类型、偏移…" /></label>
+              <button class="filter-button active" data-filter="ALL">全部</button>
+              <button class="filter-button" data-filter="IDR">IDR</button>
+              <button class="filter-button" data-filter="I">I</button>
+              <button class="filter-button" data-filter="P">P</button>
+              <button class="filter-button" data-filter="B">B</button>
+              <button class="filter-button" data-filter="SEI">SEI</button>
+              <button class="filter-button" data-filter="PARAM">参数集</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="stream-table">
+              <thead id="tableHead"></thead>
+              <tbody id="streamRows"></tbody>
+            </table>
+            <div class="empty-filter" id="emptyFilter" hidden>没有匹配的数据</div>
+          </div>
+          <div class="table-footer">
+            <span><span id="visibleCount">显示 1–20，共 1,248 帧</span><span class="preview-load-state" id="previewLoadState"> · 预览按可见区域加载</span></span>
+            <div class="legend"><span><i class="dot idr"></i>IDR</span><span><i class="dot iframe"></i>普通 I</span><span><i class="dot p"></i>P</span><span><i class="dot b"></i>B</span><span><i class="slice-mark"></i>分片帧</span></div>
+          </div>
+        </div>
+
+        <div class="panel inspector-panel">
+          <div class="inspector-header">
+            <div><span class="eyebrow">当前选择</span><h2 id="selectionTitle">Frame 0048 · P Slice</h2></div>
+            <div class="selection-size" id="selectionSize">8,412 bytes</div>
+          </div>
+          <div class="tabs" role="tablist">
+            <button data-tab="visual">画面 / 宏块</button>
+            <button class="active" data-tab="syntax">语法树</button>
+            <button data-tab="slices">Slices <span id="sliceCountBadge">2</span></button>
+            <button data-tab="hex">十六进制</button>
+            <button data-tab="refs">参考关系</button>
+            <button data-tab="summary">摘要</button>
+          </div>
+          <div class="tab-content" id="visualTab"></div>
+          <div class="tab-content active" id="syntaxTab"></div>
+          <div class="tab-content" id="slicesTab"></div>
+          <div class="tab-content" id="hexTab"></div>
+          <div class="tab-content" id="refsTab"></div>
+          <div class="tab-content" id="summaryTab"></div>
+        </div>
+      </section>
+
+      <section class="timeline-panel panel">
+        <div class="timeline-heading">
+          <div><h3>帧时间线</h3><span id="timelineRange">00:00:00.000 — 00:00:41.641</span><span class="reference-summary" id="referenceSummary"></span></div>
+          <div class="timeline-actions"><button id="zoomOut">−</button><span id="zoomLabel">100%</span><button id="zoomIn">＋</button><button id="fitTimeline">适配</button></div>
+        </div>
+        <div class="timeline-ruler" id="timelineRuler"></div>
+        <div class="timeline-track" id="timelineTrack"></div>
+        <div class="timeline-legend"><span><i class="ref-line incoming"></i>L0/L1 参考</span><span><i class="ref-line outgoing"></i>被后续帧引用</span><span><i class="ref-line missing"></i>文件外缺失参考</span><span><i class="recovery-mark"></i>SEI 恢复点</span></div>
+      </section>
+    </main>
+  </div>
+
+  <div class="drop-overlay" id="dropOverlay">
+    <div><span>⇩</span><strong>释放以分析码流</strong><small>支持 H.264 / AVC 与 H.265 / HEVC 裸码流</small></div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <dialog id="helpDialog">
+    <button class="dialog-close" id="closeHelp">×</button>
+    <span class="eyebrow">使用提示</span>
+    <h2>BitScope 快捷操作</h2>
+    <div class="shortcut-grid">
+      <span>打开文件</span><kbd>Ctrl / ⌘ + O</kbd>
+      <span>上下选择帧</span><kbd>↑ / ↓</kbd>
+      <span>切换详情页签</span><kbd>1 — 6</kbd>
+      <span>聚焦搜索</span><kbd>/</kbd>
+    </div>
+    <p>支持 Annex-B 起始码和 4 字节长度前缀码流。所有解析均在本机浏览器完成，文件不会上传。</p>
+  </dialog>
+  <script src="./app.js"></script>
+</body>
+</html>

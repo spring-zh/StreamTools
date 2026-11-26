@@ -1,0 +1,15 @@
+* text=auto eol=lf
+
+# Prebuilt runtime assets and media are binary.
+*.wasm binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.icns binary
+*.mp4 binary
+*.mov binary
+*.h264 binary
+*.h265 binary
+*.hevc binary
+*.m4v binary

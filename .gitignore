@@ -1,0 +1,36 @@
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Qt Creator
+*.pro.user
+*.pro.user.*
+*.autosave
+.qtc_clangd/
+
+# CMake / Qt build output
+build*/
+cmake-build-*/
+out/
+dist/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+Makefile
+*_autogen/
+*.app/
+
+# Local runtime and temporary files
+*.log
+*.tmp
+*.temp
+.cache/
+
+# Packaging placeholder accidentally produced by local scripts
+{{HOMEBREW_PREFIX}}/
