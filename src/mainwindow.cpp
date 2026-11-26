@@ -31,6 +31,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
@@ -45,11 +46,14 @@
 #include <QTabWidget>
 #include <QTableView>
 #include <QTextBrowser>
+#include <QTextDocument>
 #include <QTimer>
+#include <QToolBar>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QUrl>
 #include <QVBoxLayout>
+#include <QWindow>
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
@@ -86,6 +90,22 @@ private:
     }
     QString m_needle;
     QString m_type;
+};
+
+class WindowTitleBar final : public QToolBar {
+public:
+    using QToolBar::QToolBar;
+
+protected:
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        if (event->button() == Qt::LeftButton && window() && window()->windowHandle()
+            && window()->windowHandle()->startSystemMove()) {
+            event->accept();
+            return;
+        }
+        QToolBar::mousePressEvent(event);
+    }
 };
 
 QString formatBytes(qint64 bytes) {
@@ -279,32 +299,61 @@ void MainWindow::buildUi() {
     auto *central = new QWidget(this);
     central->setObjectName(QStringLiteral("appSurface"));
     auto *root = new QVBoxLayout(central);
-#ifdef Q_OS_MACOS
-    root->setContentsMargins(14, 14, 14, 10);
-#else
     root->setContentsMargins(14, 12, 14, 10);
-#endif
     root->setSpacing(10);
 
-    auto *topBar = new QFrame(central);
+    auto *topBar = new WindowTitleBar(this);
     topBar->setObjectName(QStringLiteral("topBar"));
-    auto *top = new QHBoxLayout(topBar);
-    top->setContentsMargins(0, 0, 0, 1);
-    auto *brand = new QLabel(QStringLiteral("<b style='font-size:20px;color:#f4f8fc'>BitScope</b>  <span style='color:#2bc5cc'>Stream Analyzer</span>"), topBar);
+    topBar->setMovable(false);
+    topBar->setFloatable(false);
+    topBar->setContextMenuPolicy(Qt::PreventContextMenu);
+    topBar->setAllowedAreas(Qt::TopToolBarArea);
+    topBar->setMinimumHeight(40);
+    topBar->setMaximumHeight(44);
+    addToolBar(Qt::TopToolBarArea, topBar);
+#ifdef Q_OS_MACOS
+    auto *closeWindow = new QToolButton(topBar);
+    closeWindow->setObjectName(QStringLiteral("windowClose"));
+    closeWindow->setToolTip(QStringLiteral("关闭"));
+    closeWindow->setFixedSize(13, 13);
+    connect(closeWindow, &QToolButton::clicked, this, &QWidget::close);
+    topBar->addWidget(closeWindow);
+    auto *minimizeWindow = new QToolButton(topBar);
+    minimizeWindow->setObjectName(QStringLiteral("windowMinimize"));
+    minimizeWindow->setToolTip(QStringLiteral("最小化"));
+    minimizeWindow->setFixedSize(13, 13);
+    connect(minimizeWindow, &QToolButton::clicked, this, &QWidget::showMinimized);
+    topBar->addWidget(minimizeWindow);
+    auto *zoomWindow = new QToolButton(topBar);
+    zoomWindow->setObjectName(QStringLiteral("windowZoom"));
+    zoomWindow->setToolTip(QStringLiteral("进入或退出全屏"));
+    zoomWindow->setFixedSize(13, 13);
+    connect(zoomWindow, &QToolButton::clicked, this, [this] {
+        isFullScreen() ? showNormal() : showFullScreen();
+    });
+    topBar->addWidget(zoomWindow);
+    auto *windowButtonSpacing = new QWidget(topBar);
+    windowButtonSpacing->setFixedWidth(7);
+    windowButtonSpacing->setAttribute(Qt::WA_TransparentForMouseEvents);
+    topBar->addWidget(windowButtonSpacing);
+#endif
+    auto *brand = new QLabel(QStringLiteral("<b style='font-size:18px;color:#f4f8fc'>BitScope</b>  <span style='color:#2bc5cc'>Stream Analyzer</span>"), topBar);
     brand->setObjectName(QStringLiteral("brand"));
+    brand->setAttribute(Qt::WA_TransparentForMouseEvents);
+    topBar->addWidget(brand);
+    auto *titleSpacing = new QWidget(topBar);
+    titleSpacing->setFixedWidth(12);
+    titleSpacing->setAttribute(Qt::WA_TransparentForMouseEvents);
+    topBar->addWidget(titleSpacing);
     m_fileLabel = new QLabel(QStringLiteral("尚未打开码流"), topBar);
     m_fileLabel->setObjectName(QStringLiteral("fileLabel"));
-    m_fileLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    auto *titleBox = new QVBoxLayout;
-    titleBox->setSpacing(2);
-    titleBox->addWidget(brand);
-    titleBox->addWidget(m_fileLabel);
-    top->addLayout(titleBox, 1);
+    m_fileLabel->setAttribute(Qt::WA_TransparentForMouseEvents);
+    m_fileLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    topBar->addWidget(m_fileLabel);
     auto *open = new QPushButton(QStringLiteral("打开码流…"), topBar);
     open->setObjectName(QStringLiteral("primaryButton"));
     connect(open, &QPushButton::clicked, this, &MainWindow::chooseFile);
-    top->addWidget(open);
-    root->addWidget(topBar);
+    topBar->addWidget(open);
 
     auto *metrics = new QHBoxLayout;
     m_codecMetric = metricLabel(QStringLiteral("编码"), central);
@@ -315,7 +364,19 @@ void MainWindow::buildUi() {
     metrics->addWidget(m_resolutionMetric);
     metrics->addWidget(m_frameMetric);
     metrics->addWidget(m_rateMetric);
-    metrics->addStretch(1);
+    m_frameStats = new QTextBrowser(central);
+    m_frameStats->setObjectName(QStringLiteral("frameStats"));
+    m_frameStats->setAccessibleName(QStringLiteral("当前帧统计"));
+    m_frameStats->setText(QStringLiteral("当前帧统计 · 等待选择视频帧"));
+    m_frameStats->setOpenLinks(false);
+    m_frameStats->document()->setDocumentMargin(0);
+    m_frameStats->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    // Reserve the scrollbar width even for short messages so loading detailed
+    // statistics does not change wrapping or the surrounding layout.
+    m_frameStats->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
+    m_frameStats->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    m_frameStats->setToolTip(QStringLiteral("当前帧统计 · 固定三行高度，滚动查看完整内容；可选中文字复制"));
+    metrics->addWidget(m_frameStats, 1);
     root->addLayout(metrics);
 
     auto *toolbar = new QFrame(central);
@@ -408,11 +469,6 @@ void MainWindow::buildUi() {
     overlayTools->addWidget(previewZoomIn);
     overlayTools->addWidget(previewZoomFit);
     pictureLayout->addLayout(overlayTools);
-    m_frameStats = new QLabel(QStringLiteral("当前帧统计 · 等待选择视频帧"), picturePage);
-    m_frameStats->setObjectName(QStringLiteral("frameStats"));
-    m_frameStats->setTextFormat(Qt::RichText);
-    m_frameStats->setWordWrap(true);
-    pictureLayout->addWidget(m_frameStats);
     m_macroView = new MacroblockView(picturePage);
     pictureLayout->addWidget(m_macroView, 1);
     const QString previewHint = QStringLiteral("滚轮缩放 · 放大后拖动画面 · 移动鼠标查看宏块 / CTU / Superblock 的真实尺寸、地址和所属帧单元");
@@ -553,15 +609,22 @@ void MainWindow::applyTheme() {
     setStyleSheet(QStringLiteral(R"(
         QMainWindow, QWidget { background:#0b1119; color:#dbe5ef; font-size:13px; }
         #appSurface { background:#0b1119; }
-        #topBar { background:transparent; border:0; }
+        #topBar { background:#0b1119; border:0; padding:0 10px; spacing:7px; }
         #brand { background:transparent; }
+        #windowClose, #windowMinimize, #windowZoom { border:0; border-radius:6px; padding:0; min-width:13px; max-width:13px; min-height:13px; max-height:13px; }
+        #windowClose { background:#ff5f57; }
+        #windowMinimize { background:#febc2e; }
+        #windowZoom { background:#28c840; }
+        #windowClose:hover { background:#ff756e; }
+        #windowMinimize:hover { background:#ffd05c; }
+        #windowZoom:hover { background:#4bd860; }
         QMenuBar, QMenu, QStatusBar { background:#0d151f; color:#cdd8e4; }
         QMenu::item:selected { background:#18354a; }
         #fileLabel, #hint { color:#8191a5; }
         #frameStats { background:#101923; color:#b8c7d8; border:1px solid #243343; border-radius:6px; padding:7px 10px; }
         #metric { background:#101923; border:1px solid #1e2d3d; border-radius:7px; padding:8px 12px; }
         #toolbar, #timelineBox { background:#0f1822; border:1px solid #1e2d3d; border-radius:7px; }
-        #primaryButton { background:#22b7c0; color:#061014; border:0; border-radius:7px; padding:9px 18px; font-weight:700; }
+        #primaryButton { background:#22b7c0; color:#061014; border:0; border-radius:7px; padding:7px 15px; font-weight:700; }
         #primaryButton:hover { background:#35c8d0; }
         #primaryButton:pressed { background:#179ca4; }
         QLineEdit, QComboBox, QPlainTextEdit, QTextBrowser, QTreeWidget, QTableView {
@@ -584,6 +647,10 @@ void MainWindow::applyTheme() {
         QProgressBar { background:#101923; border:1px solid #243343; border-radius:4px; }
         QProgressBar::chunk { background:#19c2c9; }
     )"));
+    // Use the themed font's line spacing (logical pixels, including DPI/font
+    // scaling), never the document height, to keep all frame states stable.
+    m_frameStats->ensurePolished();
+    m_frameStats->setFixedHeight(m_frameStats->fontMetrics().lineSpacing() * 3 + 16);
 }
 
 void MainWindow::chooseFile() {

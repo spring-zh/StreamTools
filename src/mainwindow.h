@@ -85,7 +85,7 @@ private:
     QTreeWidget *m_fileTree = nullptr;
     MacroblockView *m_macroView = nullptr;
     QLabel *m_unitInfo = nullptr;
-    QLabel *m_frameStats = nullptr;
+    QTextBrowser *m_frameStats = nullptr;
     QTreeWidget *m_slices = nullptr;
     QTreeWidget *m_cuTree = nullptr;
     QTreeWidget *m_syntax = nullptr;
