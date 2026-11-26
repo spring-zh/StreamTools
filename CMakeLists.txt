@@ -129,6 +129,6 @@ if(BITSCOPE_BUILD_TESTS)
         src/av1blockprovider.cpp
     )
     target_include_directories(BitScopeAv1BlockSmoke PRIVATE src)
-    target_link_libraries(BitScopeAv1BlockSmoke PRIVATE Qt6::Core Qt6::Gui)
+    target_link_libraries(BitScopeAv1BlockSmoke PRIVATE Qt6::Core Qt6::Gui Qt6::Concurrent)
     target_compile_definitions(BitScopeAv1BlockSmoke PRIVATE QT_NO_KEYWORDS)
 endif()

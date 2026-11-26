@@ -156,6 +156,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     connect(m_previews, &PreviewProvider::thumbnailReady, this, [this](int frame, const QImage &image) {
         m_model->setThumbnail(frame, image);
         m_macroView->setFrameImage(frame, image);
+        if (m_stream && m_stream->codec == Codec::Av1 && frame == m_currentFrame
+            && !m_stream->frames.at(frame).av1CodingBlocksReady)
+            m_av1BlockProvider->requestFrame(frame);
     });
     connect(m_previews, &PreviewProvider::decodedUnitsReady, this,
             [this](int frameIndex, const QVector<DecodedUnitInfo> &units) {
@@ -188,6 +191,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
         m_macroView->setFrameError(frame, reason.left(500));
         if (m_table->currentIndex().data(FrameTableModel::ItemIndexRole).toInt() == frame)
             m_status->setText(QStringLiteral("Frame %1 预览失败：%2").arg(frame).arg(reason.left(180)));
+        if (m_stream && m_stream->codec == Codec::Av1 && frame == m_currentFrame
+            && !m_stream->frames.at(frame).av1CodingBlocksReady)
+            m_av1BlockProvider->requestFrame(frame);
     });
     connect(m_hevcCuProvider, &HevcCuProvider::codingUnitsReady, this,
             [this](int frameIndex, const QVector<HevcCodingUnitInfo> &units) {
@@ -830,7 +836,8 @@ void MainWindow::showFrame(int frameIndex) {
     if (cached.isNull()) m_previews->requestFrame(frameIndex);
     if (m_stream->codec == Codec::Hevc && !frame.hevcCodingUnitsReady)
         m_hevcCuProvider->requestFrame(frameIndex);
-    if (m_stream->codec == Codec::Av1 && !frame.av1CodingBlocksReady)
+    if (m_stream->codec == Codec::Av1 && !cached.isNull()
+        && !frame.av1CodingBlocksReady)
         m_av1BlockProvider->requestFrame(frameIndex);
     m_timeline->setSelectedFrame(frameIndex);
     updateCuTree(frameIndex);
@@ -1022,9 +1029,6 @@ void MainWindow::updateVisiblePreviews() {
             if (m_stream->codec == Codec::Hevc
                 && !m_stream->frames.at(frame).hevcCodingUnitsReady)
                 m_hevcCuProvider->requestFrame(frame);
-            if (m_stream->codec == Codec::Av1
-                && !m_stream->frames.at(frame).av1CodingBlocksReady)
-                m_av1BlockProvider->requestFrame(frame);
         }
     }
 }

@@ -10,6 +10,7 @@
 #include <QJsonObject>
 #include <QRegularExpression>
 #include <QStandardPaths>
+#include <QtConcurrent>
 
 #include <algorithm>
 #include <cmath>
@@ -116,6 +117,8 @@ Av1BlockProvider::Av1BlockProvider(QObject *parent) : QObject(parent)
     connect(&m_process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
             this, &Av1BlockProvider::processFinished);
     connect(&m_process, &QProcess::errorOccurred, this, &Av1BlockProvider::processError);
+    connect(&m_parseWatcher, &QFutureWatcher<Av1BlockParseResult>::finished,
+            this, &Av1BlockProvider::parseFinished);
 }
 
 Av1BlockProvider::~Av1BlockProvider()
@@ -124,10 +127,13 @@ Av1BlockProvider::~Av1BlockProvider()
         m_process.kill();
         m_process.waitForFinished(1000);
     }
+    if (m_parseWatcher.isRunning())
+        m_parseWatcher.waitForFinished();
 }
 
 void Av1BlockProvider::setStream(StreamPtr stream)
 {
+    ++m_generation;
     if (m_process.state() != QProcess::NotRunning) {
         m_process.kill();
         m_process.waitForFinished(1000);
@@ -170,6 +176,7 @@ QString Av1BlockProvider::analyzerPath() const
 
 void Av1BlockProvider::requestFrame(int frameIndex)
 {
+    m_pending.clear();
     requestRange(frameIndex, frameIndex);
 }
 
@@ -191,7 +198,8 @@ void Av1BlockProvider::requestRange(int first, int last)
         }
         m_pending.insert(index);
     }
-    if (!m_pending.isEmpty() && m_process.state() == QProcess::NotRunning)
+    if (!m_pending.isEmpty() && m_process.state() == QProcess::NotRunning
+        && !m_parseWatcher.isRunning())
         m_queueTimer.start();
 }
 
@@ -251,7 +259,8 @@ QByteArray Av1BlockProvider::ivfSegment(int first, int last) const
 
 void Av1BlockProvider::processQueue()
 {
-    if (!m_stream || m_pending.isEmpty() || m_process.state() != QProcess::NotRunning)
+    if (!m_stream || m_pending.isEmpty() || m_process.state() != QProcess::NotRunning
+        || m_parseWatcher.isRunning())
         return;
     const QString executable = analyzerPath();
     if (executable.isEmpty()) {
@@ -312,22 +321,34 @@ void Av1BlockProvider::processQueue()
     m_process.setWorkingDirectory(m_activeDirectory);
     Q_EMIT statusChanged(QStringLiteral("正在解析 AV1 Superblock/Coding Block F%1–F%2")
                              .arg(m_activeStart).arg(m_activeEnd));
-    m_process.start(executable, arguments);
+    QString program = executable;
+    QStringList processArguments = arguments;
+#ifndef Q_OS_WIN
+    const QString nice = QStandardPaths::findExecutable(QStringLiteral("nice"));
+    if (!nice.isEmpty()) {
+        processArguments.prepend(executable);
+        processArguments.prepend(QStringLiteral("10"));
+        processArguments.prepend(QStringLiteral("-n"));
+        program = nice;
+    }
+#endif
+    m_process.start(program, processArguments);
 }
 
-QVector<QVector<Av1CodingBlockInfo>> Av1BlockProvider::parseOutput(QString *error)
+Av1BlockParseResult Av1BlockProvider::parseOutput(const QByteArray &data,
+                                                  const StreamPtr &stream,
+                                                  int activeStart)
 {
-    QVector<QVector<Av1CodingBlockInfo>> frames;
+    Av1BlockParseResult result;
     QJsonParseError parseError;
-    const QJsonDocument document = QJsonDocument::fromJson(
-        m_process.readAllStandardOutput(), &parseError);
+    const QJsonDocument document = QJsonDocument::fromJson(data, &parseError);
     if (parseError.error != QJsonParseError::NoError || !document.isArray()) {
-        if (error)
-            *error = QStringLiteral("AV1 inspection JSON 解析失败：%1").arg(parseError.errorString());
-        return frames;
+        result.error = QStringLiteral("AV1 inspection JSON 解析失败：%1")
+                           .arg(parseError.errorString());
+        return result;
     }
 
-    const int miColumns = (m_stream->width + 3) / 4;
+    const int miColumns = (stream->width + 3) / 4;
     const QJsonArray frameArray = document.array();
     for (const QJsonValue &frameValue : frameArray) {
         if (!frameValue.isObject())
@@ -364,7 +385,7 @@ QVector<QVector<Av1CodingBlockInfo>> Av1BlockProvider::parseOutput(QString *erro
                 const int originRow = (row / heightMi) * heightMi;
                 const int x = originColumn * 4;
                 const int y = originRow * 4;
-                if (x >= m_stream->width || y >= m_stream->height)
+                if (x >= stream->width || y >= stream->height)
                     continue;
                 const QString key = QStringLiteral("%1:%2:%3:%4")
                     .arg(x).arg(y).arg(dimensions.first).arg(dimensions.second);
@@ -377,12 +398,12 @@ QVector<QVector<Av1CodingBlockInfo>> Av1BlockProvider::parseOutput(QString *erro
                 block.y = y;
                 block.codedWidth = dimensions.first;
                 block.codedHeight = dimensions.second;
-                block.width = std::min(block.codedWidth, m_stream->width - x);
-                block.height = std::min(block.codedHeight, m_stream->height - y);
-                block.superblockAddress = (y / m_stream->frames.at(m_activeStart).unitSize)
-                        * m_stream->frames.at(m_activeStart).unitColumns
-                    + x / m_stream->frames.at(m_activeStart).unitSize;
-                block.depth = visualDepth(m_stream->frames.at(m_activeStart).unitSize,
+                block.width = std::min(block.codedWidth, stream->width - x);
+                block.height = std::min(block.codedHeight, stream->height - y);
+                block.superblockAddress = (y / stream->frames.at(activeStart).unitSize)
+                        * stream->frames.at(activeStart).unitColumns
+                    + x / stream->frames.at(activeStart).unitSize;
+                block.depth = visualDepth(stream->frames.at(activeStart).unitSize,
                                           block.codedWidth, block.codedHeight);
                 block.blockSize = enumName.mid(QStringLiteral("BLOCK_").size());
                 block.predictionMode = cleanEnumName(modeNames.value(
@@ -418,9 +439,9 @@ QVector<QVector<Av1CodingBlockInfo>> Av1BlockProvider::parseOutput(QString *erro
         std::sort(blocks.begin(), blocks.end(), [](const auto &left, const auto &right) {
             return left.y == right.y ? left.x < right.x : left.y < right.y;
         });
-        frames.push_back(std::move(blocks));
+        result.frames.push_back(std::move(blocks));
     }
-    return frames;
+    return result;
 }
 
 void Av1BlockProvider::processFinished(int exitCode, QProcess::ExitStatus status)
@@ -434,34 +455,56 @@ void Av1BlockProvider::processFinished(int exitCode, QProcess::ExitStatus status
             m_failed.insert(index);
             Q_EMIT codingBlocksUnavailable(index, reason);
         }
-    } else {
-        QString parseError;
-        const auto frames = parseOutput(&parseError);
+        clearActiveFiles();
+        Q_EMIT statusChanged(reason);
+        if (!m_pending.isEmpty())
+            m_queueTimer.start();
+        return;
+    }
+
+    const QByteArray output = m_process.readAllStandardOutput();
+    m_parseRequested = m_activeRequested;
+    m_parseStart = m_activeStart;
+    m_parseEnd = m_activeEnd;
+    m_parseGeneration = m_generation;
+    const StreamPtr stream = m_stream;
+    clearActiveFiles();
+    Q_EMIT statusChanged(QStringLiteral("正在后台整理 AV1 Coding Block 数据…"));
+    m_parseWatcher.setFuture(QtConcurrent::run(
+        [output, stream, start = m_parseStart] {
+            return Av1BlockProvider::parseOutput(output, stream, start);
+        }));
+}
+
+void Av1BlockProvider::parseFinished()
+{
+    const Av1BlockParseResult result = m_parseWatcher.result();
+    if (m_parseGeneration == m_generation && m_stream
+        && m_parseStart >= 0 && m_parseEnd < m_stream->frames.size()) {
         QVector<int> decodedFrameIndices;
-        for (int index = m_activeStart; index <= m_activeEnd; ++index) {
+        for (int index = m_parseStart; index <= m_parseEnd; ++index) {
             if (m_stream->frames.at(index).displayType != QStringLiteral("SHOW_EXISTING"))
                 decodedFrameIndices.push_back(index);
         }
-        for (int relative = 0; relative < frames.size()
+        for (int relative = 0; relative < result.frames.size()
              && relative < decodedFrameIndices.size(); ++relative) {
             const int frameIndex = decodedFrameIndices.at(relative);
-            if (!frames.at(relative).isEmpty()) {
+            if (!result.frames.at(relative).isEmpty()) {
                 m_cached.insert(frameIndex);
-                Q_EMIT codingBlocksReady(frameIndex, frames.at(relative));
+                Q_EMIT codingBlocksReady(frameIndex, result.frames.at(relative));
             }
         }
-        for (int index : m_activeRequested) {
+        for (int index : m_parseRequested) {
             if (!m_cached.contains(index)) {
-                const QString reason = parseError.isEmpty()
+                const QString reason = result.error.isEmpty()
                     ? QStringLiteral("分析器未输出 Frame %1 的 AV1 Coding Block").arg(index)
-                    : parseError;
+                    : result.error;
                 m_failed.insert(index);
                 Q_EMIT codingBlocksUnavailable(index, reason);
             }
         }
     }
 
-    clearActiveFiles();
     Q_EMIT statusChanged(m_pending.isEmpty()
         ? QStringLiteral("AV1 Superblock/Coding Block 已按需加载")
         : QStringLiteral("等待解析 %1 帧 AV1 块数据").arg(m_pending.size()));
