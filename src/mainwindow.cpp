@@ -1,5 +1,6 @@
 #include "mainwindow.h"
 
+#include "av1blockprovider.h"
 #include "bitstreamparser.h"
 #include "frametablemodel.h"
 #include "hevccuprovider.h"
@@ -149,6 +150,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     applyTheme();
     m_previews = new PreviewProvider(this);
     m_hevcCuProvider = new HevcCuProvider(this);
+    m_av1BlockProvider = new Av1BlockProvider(this);
 
     connect(&m_watcher, &QFutureWatcher<StreamPtr>::finished, this, &MainWindow::parseFinished);
     connect(m_previews, &PreviewProvider::thumbnailReady, this, [this](int frame, const QImage &image) {
@@ -214,6 +216,33 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
         }
     });
     connect(m_hevcCuProvider, &HevcCuProvider::statusChanged, m_status, &QLabel::setText);
+    connect(m_av1BlockProvider, &Av1BlockProvider::codingBlocksReady, this,
+            [this](int frameIndex, const QVector<Av1CodingBlockInfo> &blocks) {
+        if (!m_stream || frameIndex < 0 || frameIndex >= m_stream->frames.size())
+            return;
+        FrameInfo &frame = m_stream->frames[frameIndex];
+        frame.av1CodingBlocks = blocks;
+        frame.av1CodingBlocksReady = true;
+        frame.av1CodingBlocksError.clear();
+        if (frameIndex == m_currentFrame) {
+            m_macroView->refreshFrameData();
+            updateFrameStatistics(frameIndex);
+            updateCuTree(frameIndex);
+        }
+    });
+    connect(m_av1BlockProvider, &Av1BlockProvider::codingBlocksUnavailable, this,
+            [this](int frameIndex, const QString &reason) {
+        if (!m_stream || frameIndex < 0 || frameIndex >= m_stream->frames.size())
+            return;
+        FrameInfo &frame = m_stream->frames[frameIndex];
+        frame.av1CodingBlocksError = reason;
+        if (frameIndex == m_currentFrame) {
+            m_macroView->refreshFrameData();
+            updateFrameStatistics(frameIndex);
+            updateCuTree(frameIndex);
+        }
+    });
+    connect(m_av1BlockProvider, &Av1BlockProvider::statusChanged, m_status, &QLabel::setText);
     clearDetails(QStringLiteral("拖入或打开 MP4、H.264、H.265、MPEG-4 Part 2 或 AV1 视频开始分析"));
 }
 
@@ -326,10 +355,10 @@ void MainWindow::buildUi() {
     auto *qpOverlay = new QCheckBox(QStringLiteral("QP 热力图"), picturePage);
     qpOverlay->setObjectName(QStringLiteral("qpOverlay"));
     grid->setChecked(true);
-    grid->setToolTip(QStringLiteral("H.264 / MPEG-4 Part 2 显示 16×16 宏块；H.265 显示 CTU/CU；AV1 显示 64×64 或 128×128 Superblock 根网格"));
+    grid->setToolTip(QStringLiteral("H.264 / MPEG-4 Part 2 显示 16×16 宏块；H.265 显示 CTU/CU；AV1 显示 Superblock 与实际 Coding Block"));
     slices->setChecked(true);
     qpOverlay->setChecked(false);
-    qpOverlay->setToolTip(QStringLiteral("按实际解码 QP 着色：蓝色较低，红色较高；H.264 / MPEG-4 按宏块，H.265 按叶子 CU"));
+    qpOverlay->setToolTip(QStringLiteral("按实际解码量化值着色：蓝色较低，红色较高；AV1 按 Coding Block QIndex"));
     overlayTools->addWidget(grid);
     overlayTools->addWidget(slices);
     overlayTools->addWidget(qpOverlay);
@@ -558,6 +587,7 @@ void MainWindow::openFile(const QString &path) {
     m_fileTree->clear();
     m_previews->setStream({});
     m_hevcCuProvider->setStream({});
+    m_av1BlockProvider->setStream({});
     m_timeline->setStream({});
     m_macroView->setStream({});
     m_currentFrame = -1;
@@ -577,20 +607,30 @@ void MainWindow::parseFinished() {
     m_model->setStream(m_stream);
     m_previews->setStream(m_stream);
     m_hevcCuProvider->setStream(m_stream);
+    m_av1BlockProvider->setStream(m_stream);
     m_timeline->setStream(m_stream);
     m_macroView->setStream(m_stream);
     const bool mpeg4 = m_stream->codec == Codec::Mpeg4Visual;
     const bool av1 = m_stream->codec == Codec::Av1;
     if (auto *qpOverlay = findChild<QCheckBox *>(QStringLiteral("qpOverlay"))) {
-        qpOverlay->setEnabled(!av1);
+        qpOverlay->setEnabled(true);
+        qpOverlay->setText(av1 ? QStringLiteral("QIndex 热力图")
+                               : QStringLiteral("QP 热力图"));
         qpOverlay->setToolTip(av1
-            ? QStringLiteral("AV1 块级 QIndex 位于熵编码数据中，当前版本不伪造热力图")
+            ? QStringLiteral("按 libaom inspection 导出的真实块级 QIndex 着色：蓝色较低，红色较高")
             : QStringLiteral("按实际解码 QP 着色：蓝色较低，红色较高"));
     }
     m_tabs->setTabText(0, av1 ? QStringLiteral("画面 / Superblock") : QStringLiteral("画面 / 宏块"));
     m_mode->setItemText(1, mpeg4 ? QStringLiteral("起始码单元视图") : (av1 ? QStringLiteral("OBU 视图") : QStringLiteral("NAL 视图")));
     m_tabs->setTabText(m_tabs->indexOf(m_slices), mpeg4 ? QStringLiteral("VOP") : (av1 ? QStringLiteral("Frame Header") : QStringLiteral("Slice")));
-    m_tabs->setTabText(m_tabs->indexOf(m_cuTree), av1 ? QStringLiteral("Superblock") : QStringLiteral("CTU / CU"));
+    m_tabs->setTabText(m_tabs->indexOf(m_cuTree), av1 ? QStringLiteral("Superblock / Block") : QStringLiteral("CTU / CU"));
+    m_cuTree->setHeaderLabels(av1
+        ? QStringList{QStringLiteral("Superblock / Coding Block"), QStringLiteral("位置"),
+            QStringLiteral("块尺寸"), QStringLiteral("尺寸层级"), QStringLiteral("预测模式"),
+            QStringLiteral("色度 / 变换"), QStringLiteral("QIndex"), QStringLiteral("参考 / MV")}
+        : QStringList{QStringLiteral("CTU / CU"), QStringLiteral("位置"),
+            QStringLiteral("编码尺寸"), QStringLiteral("深度"), QStringLiteral("分区"),
+            QStringLiteral("预测"), QStringLiteral("QP"), QStringLiteral("近似字节")});
     m_tabs->setTabText(m_tabs->indexOf(m_syntax), av1 ? QStringLiteral("语法树 / Metadata") : QStringLiteral("语法树 / SEI"));
     m_slices->setHeaderLabels(mpeg4
         ? QStringList{QStringLiteral("VOP"), QStringLiteral("类型"), QStringLiteral("起始宏块"), QStringLiteral("覆盖范围"), QStringLiteral("量化值"), QStringLiteral("实际平均 QP")}
@@ -790,6 +830,8 @@ void MainWindow::showFrame(int frameIndex) {
     if (cached.isNull()) m_previews->requestFrame(frameIndex);
     if (m_stream->codec == Codec::Hevc && !frame.hevcCodingUnitsReady)
         m_hevcCuProvider->requestFrame(frameIndex);
+    if (m_stream->codec == Codec::Av1 && !frame.av1CodingBlocksReady)
+        m_av1BlockProvider->requestFrame(frameIndex);
     m_timeline->setSelectedFrame(frameIndex);
     updateCuTree(frameIndex);
 
@@ -801,7 +843,9 @@ void MainWindow::showFrame(int frameIndex) {
         const QString start = m_stream->codec == Codec::Hevc ? QString::number(slice.address) : QString::number(slice.firstMb);
         const QString range = region == frame.regions.end() ? QStringLiteral("—") : QStringLiteral("%1–%2").arg(region->start).arg(std::max(region->start, region->end - 1));
         const bool qpReady = m_stream->codec == Codec::Hevc
-            ? frame.hevcCodingUnitsReady : (m_stream->codec != Codec::Av1 && frame.decodedUnitsReady);
+            ? frame.hevcCodingUnitsReady
+            : (m_stream->codec == Codec::Av1 ? frame.av1CodingBlocksReady
+                                             : frame.decodedUnitsReady);
         const QString qp = qpReady ? QStringLiteral("计算中") : QStringLiteral("—");
         const QString identifier = m_stream->codec == Codec::Mpeg4Visual
             ? QStringLiteral("VOP / 单元 %1").arg(nal.index)
@@ -879,8 +923,15 @@ void MainWindow::showFrame(int frameIndex) {
         unitDescription = QStringLiteral("宏块网格：%1 × %2，标准单元 16×16，边缘按可见像素裁剪")
             .arg(frame.unitColumns).arg(frame.unitRows);
     } else if (m_stream->codec == Codec::Av1) {
-        unitDescription = QStringLiteral("Superblock 根网格：%1 × %2，根单元 %3×%3；AV1 内部块可继续拆分至 4×4，当前版本显示根网格和 Frame Header 语法")
-            .arg(frame.unitColumns).arg(frame.unitRows).arg(frame.unitSize);
+        const QString blockState = frame.av1CodingBlocksReady
+            ? QStringLiteral("已由 libaom inspection 导出 <b>%1</b> 个真实 Coding Block，包含非方形块、预测模式、变换、QIndex、参考帧和运动矢量")
+                  .arg(frame.av1CodingBlocks.size())
+            : (frame.av1CodingBlocksError.isEmpty()
+                ? QStringLiteral("正在按需解析内部 Coding Block…")
+                : frame.av1CodingBlocksError.toHtmlEscaped());
+        unitDescription = QStringLiteral("Superblock 根网格：%1 × %2，根单元 %3×%3；内部块最小可到 4×4<br>"
+                                         "<span style='color:#8191a5'>%4</span>")
+            .arg(frame.unitColumns).arg(frame.unitRows).arg(frame.unitSize).arg(blockState);
     } else {
         const ParameterSetInfo sps = m_stream->sps.value(m_stream->primarySpsId);
         const QString cuState = frame.hevcCodingUnitsReady
@@ -971,6 +1022,9 @@ void MainWindow::updateVisiblePreviews() {
             if (m_stream->codec == Codec::Hevc
                 && !m_stream->frames.at(frame).hevcCodingUnitsReady)
                 m_hevcCuProvider->requestFrame(frame);
+            if (m_stream->codec == Codec::Av1
+                && !m_stream->frames.at(frame).av1CodingBlocksReady)
+                m_av1BlockProvider->requestFrame(frame);
         }
     }
 }
@@ -1076,18 +1130,65 @@ void MainWindow::updateFrameStatistics(int frameIndex)
             refreshFlags |= header.refreshFrameFlags;
             showExisting |= header.showExistingFrame;
         }
+        if (!frame.av1CodingBlocksReady) {
+            const QString state = frame.av1CodingBlocksError.isEmpty()
+                ? QStringLiteral("正在通过 libaom inspection 解析真实 Coding Block…")
+                : frame.av1CodingBlocksError.toHtmlEscaped();
+            m_frameStats->setText(
+                QStringLiteral("<b>当前帧 F%1 · AV1</b>　Superblock <b>%2</b>（%3 × %4）　"
+                               "根尺寸 %5×%5　Frame Header %6　Order Hint %7<br>"
+                               "<span style='color:#8191a5'>refresh_frame_flags=0x%8%9　·　%10</span>")
+                    .arg(frame.index).arg(totalUnits).arg(frame.unitColumns).arg(frame.unitRows)
+                    .arg(frame.unitSize).arg(frame.sliceNalIndices.size())
+                    .arg(frame.poc >= 0 ? QString::number(frame.poc) : QStringLiteral("—"))
+                    .arg(refreshFlags, 2, 16, QChar('0'))
+                    .arg(showExisting ? QStringLiteral("　·　show_existing_frame") : QString())
+                    .arg(state));
+            for (int i = 0; i < m_slices->topLevelItemCount(); ++i)
+                m_slices->topLevelItem(i)->setText(5, QStringLiteral("加载中"));
+            return;
+        }
+
+        QMap<QString, int> sizeCounts;
+        QMap<QString, int> modeCounts;
+        double qSum = 0.0;
+        int qCount = 0;
+        int qMinimum = 999;
+        int qMaximum = -999;
+        int skipped = 0;
+        for (const auto &block : frame.av1CodingBlocks) {
+            ++sizeCounts[block.blockSize];
+            ++modeCounts[block.predictionMode];
+            skipped += block.skip ? 1 : 0;
+            if (block.qIndex >= 0) {
+                qSum += block.qIndex;
+                ++qCount;
+                qMinimum = std::min(qMinimum, block.qIndex);
+                qMaximum = std::max(qMaximum, block.qIndex);
+            }
+        }
+        QStringList sizes;
+        for (auto it = sizeCounts.cbegin(); it != sizeCounts.cend(); ++it)
+            sizes << QStringLiteral("%1: %2").arg(it.key()).arg(it.value());
+        QStringList modes;
+        for (auto it = modeCounts.cbegin(); it != modeCounts.cend(); ++it)
+            modes << QStringLiteral("%1 %2").arg(it.key()).arg(it.value());
+        const QString qText = qCount == 0 ? QStringLiteral("—")
+            : QStringLiteral("平均 %1，最小/最大 %2/%3")
+                  .arg(qSum / qCount, 0, 'f', 2).arg(qMinimum).arg(qMaximum);
         m_frameStats->setText(
-            QStringLiteral("<b>当前帧 F%1 · AV1</b>　Superblock <b>%2</b>（%3 × %4）　"
-                           "根尺寸 %5×%5　Frame Header %6　Order Hint %7<br>"
-                           "<span style='color:#8191a5'>refresh_frame_flags=0x%8%9　·　"
-                           "内部块可拆分至 4×4；块级 QIndex/分区需要熵解码器导出</span>")
-                .arg(frame.index).arg(totalUnits).arg(frame.unitColumns).arg(frame.unitRows)
-                .arg(frame.unitSize).arg(frame.sliceNalIndices.size())
-                .arg(frame.poc >= 0 ? QString::number(frame.poc) : QStringLiteral("—"))
-                .arg(refreshFlags, 2, 16, QChar('0'))
-                .arg(showExisting ? QStringLiteral("　·　show_existing_frame") : QString()));
+            QStringLiteral("<b>当前帧 F%1 · AV1 实际 Coding Block</b>　Superblock <b>%2</b>　"
+                           "叶子块 <b style='color:#19c2c9'>%3</b>　QIndex %4　Skip %5<br>"
+                           "<span style='color:#8191a5'>尺寸：%6<br>预测：%7</span>")
+                .arg(frame.index).arg(totalUnits).arg(frame.av1CodingBlocks.size())
+                .arg(qText).arg(skipped)
+                .arg(sizes.join(QStringLiteral("　")))
+                .arg(modes.join(QStringLiteral("　"))));
         for (int i = 0; i < m_slices->topLevelItemCount(); ++i)
-            m_slices->topLevelItem(i)->setText(5, QStringLiteral("需熵解码"));
+            m_slices->topLevelItem(i)->setText(5, qCount > 0
+                ? QStringLiteral("%1（%2–%3）").arg(qSum / qCount, 0, 'f', 2)
+                      .arg(qMinimum).arg(qMaximum)
+                : QStringLiteral("—"));
         return;
     }
     if (!frame.decodedUnitsReady) {
@@ -1202,25 +1303,39 @@ void MainWindow::updateCuTree(int frameIndex)
     }
     const FrameInfo &frame = m_stream->frames.at(frameIndex);
     if (m_stream->codec == Codec::Av1) {
-        const int total = frame.unitColumns * frame.unitRows;
-        for (int address = 0; address < total; ++address) {
+        if (!frame.av1CodingBlocksReady) {
+            new QTreeWidgetItem(m_cuTree, {frame.av1CodingBlocksError.isEmpty()
+                ? QStringLiteral("正在按需解析 Frame %1 的 AV1 Coding Block…").arg(frame.index)
+                : frame.av1CodingBlocksError});
+            m_cuTree->setUpdatesEnabled(true);
+            return;
+        }
+        QMap<int, int> blockCounts;
+        for (const auto &block : frame.av1CodingBlocks)
+            ++blockCounts[block.superblockAddress];
+        for (auto count = blockCounts.cbegin(); count != blockCounts.cend(); ++count) {
+            const int address = count.key();
             const int column = address % frame.unitColumns;
             const int row = address / frame.unitColumns;
             const int x = column * frame.unitSize;
             const int y = row * frame.unitSize;
             const int width = std::min(frame.unitSize, m_stream->width - x);
             const int height = std::min(frame.unitSize, m_stream->height - y);
-            auto *item = new QTreeWidgetItem(m_cuTree, {
-                QStringLiteral("Superblock %1").arg(address),
+            auto *root = new QTreeWidgetItem(m_cuTree, {
+                QStringLiteral("Superblock %1（%2 个 Coding Block）").arg(address).arg(count.value()),
                 QStringLiteral("(%1, %2)").arg(x).arg(y),
                 width == frame.unitSize && height == frame.unitSize
                     ? QStringLiteral("%1×%1").arg(frame.unitSize)
                     : QStringLiteral("%1×%1（可见 %2×%3）")
                           .arg(frame.unitSize).arg(width).arg(height),
-                QStringLiteral("0"), QStringLiteral("AV1 根 Superblock"),
-                QStringLiteral("内部块需熵解码")
+                QStringLiteral("0"), QStringLiteral("AV1 Superblock 根")
             });
-            item->setForeground(0, QColor(QStringLiteral("#19c2c9")));
+            root->setData(0, Qt::UserRole, address);
+            root->setData(0, Qt::UserRole + 1, frameIndex);
+            root->setForeground(0, QColor(QStringLiteral("#19c2c9")));
+            auto *placeholder = new QTreeWidgetItem(root, {QStringLiteral("展开加载 Coding Block 详情…")});
+            placeholder->setData(0, Qt::UserRole, true);
+            placeholder->setForeground(0, QColor(QStringLiteral("#8191a5")));
         }
         for (int column = 0; column < m_cuTree->columnCount(); ++column)
             m_cuTree->resizeColumnToContents(column);
@@ -1270,7 +1385,9 @@ void MainWindow::updateCuTree(int frameIndex)
 
 void MainWindow::populateCuTreeChildren(QTreeWidgetItem *root)
 {
-    if (!root || !m_stream || m_stream->codec != Codec::Hevc || root->treeWidget() != m_cuTree)
+    if (!root || !m_stream
+        || (m_stream->codec != Codec::Hevc && m_stream->codec != Codec::Av1)
+        || root->treeWidget() != m_cuTree)
         return;
     const int frameIndex = root->data(0, Qt::UserRole + 1).toInt();
     const int ctuAddress = root->data(0, Qt::UserRole).toInt();
@@ -1281,6 +1398,48 @@ void MainWindow::populateCuTreeChildren(QTreeWidgetItem *root)
 
     delete root->takeChild(0);
     const FrameInfo &frame = m_stream->frames.at(frameIndex);
+    if (m_stream->codec == Codec::Av1) {
+        int blockIndex = 0;
+        m_cuTree->setUpdatesEnabled(false);
+        for (const auto &block : frame.av1CodingBlocks) {
+            if (block.superblockAddress != ctuAddress)
+                continue;
+            const QString visible = block.width == block.codedWidth
+                    && block.height == block.codedHeight
+                ? QStringLiteral("%1×%2").arg(block.codedWidth).arg(block.codedHeight)
+                : QStringLiteral("%1×%2（可见 %3×%4）")
+                      .arg(block.codedWidth).arg(block.codedHeight)
+                      .arg(block.width).arg(block.height);
+            QString flags;
+            if (block.skip)
+                flags += QStringLiteral("Skip · ");
+            if (block.intraBlockCopy)
+                flags += QStringLiteral("IntraBC · ");
+            const QString transform = QStringLiteral("%1 · TX %2/%3%4")
+                .arg(block.uvPredictionMode, block.transformSize, block.transformType,
+                     flags.isEmpty() ? QString() : QStringLiteral(" · ") + flags.chopped(3));
+            QString reference = block.referenceFrames;
+            if (!reference.isEmpty() && !reference.contains(QStringLiteral("INTRA FRAME"))) {
+                reference += QStringLiteral(" · MV0(%1,%2)")
+                    .arg(block.motionVector0X).arg(block.motionVector0Y);
+                if (block.motionVector1X != 0 || block.motionVector1Y != 0)
+                    reference += QStringLiteral(" MV1(%1,%2)")
+                        .arg(block.motionVector1X).arg(block.motionVector1Y);
+            }
+            auto *item = new QTreeWidgetItem(root, {
+                QStringLiteral("Coding Block %1").arg(blockIndex++),
+                QStringLiteral("(%1, %2)").arg(block.x).arg(block.y),
+                visible, QString::number(block.depth), block.predictionMode,
+                transform,
+                block.qIndex >= 0 ? QString::number(block.qIndex) : QStringLiteral("—"),
+                reference.isEmpty() ? QStringLiteral("—") : reference
+            });
+            item->setForeground(4, block.predictionMode.contains(QStringLiteral("PRED"))
+                ? QColor(QStringLiteral("#f4a261")) : QColor(QStringLiteral("#58a6ff")));
+        }
+        m_cuTree->setUpdatesEnabled(true);
+        return;
+    }
     const int rootX = (ctuAddress % frame.unitColumns) * frame.unitSize;
     const int rootY = (ctuAddress / frame.unitColumns) * frame.unitSize;
     QHash<QString, QTreeWidgetItem *> branches;

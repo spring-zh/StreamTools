@@ -24,6 +24,8 @@ qt_add_executable(BitScopeQt
     src/previewprovider.cpp
     src/hevccuprovider.h
     src/hevccuprovider.cpp
+    src/av1blockprovider.h
+    src/av1blockprovider.cpp
     src/macroblockview.h
     src/macroblockview.cpp
     src/timelinewidget.h
@@ -59,6 +61,33 @@ if(BITSCOPE_HEVC_ANALYZER AND EXISTS "${BITSCOPE_HEVC_ANALYZER}")
         VERBATIM)
 endif()
 
+set(BITSCOPE_AV1_INSPECT_EXECUTABLE "" CACHE FILEPATH
+    "Optional libaom inspect executable (CONFIG_INSPECTION=1) to bundle for AV1 block extraction")
+if(BITSCOPE_AV1_INSPECT_EXECUTABLE AND EXISTS "${BITSCOPE_AV1_INSPECT_EXECUTABLE}")
+    if(WIN32)
+        set(_bitscope_av1_helper_name "av1inspect.exe")
+    else()
+        set(_bitscope_av1_helper_name "av1inspect")
+    endif()
+    if(APPLE)
+        set(_bitscope_av1_resource_dir "$<TARGET_BUNDLE_CONTENT_DIR:BitScopeQt>/Resources")
+    else()
+        set(_bitscope_av1_resource_dir "$<TARGET_FILE_DIR:BitScopeQt>")
+    endif()
+    add_custom_command(TARGET BitScopeQt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${_bitscope_av1_resource_dir}/tools"
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${_bitscope_av1_resource_dir}/licenses/aom-inspection"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${BITSCOPE_AV1_INSPECT_EXECUTABLE}"
+            "${_bitscope_av1_resource_dir}/tools/${_bitscope_av1_helper_name}"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/aom-inspection"
+            "${_bitscope_av1_resource_dir}/licenses/aom-inspection"
+        VERBATIM)
+endif()
+
 target_link_libraries(BitScopeQt PRIVATE Qt6::Widgets Qt6::Concurrent)
 target_compile_definitions(BitScopeQt PRIVATE QT_NO_KEYWORDS)
 
@@ -87,3 +116,19 @@ qt_generate_deploy_app_script(
     NO_UNSUPPORTED_PLATFORM_ERROR
 )
 install(SCRIPT ${deploy_script})
+
+option(BITSCOPE_BUILD_TESTS "Build BitScope smoke-test helpers" OFF)
+if(BITSCOPE_BUILD_TESTS)
+    qt_add_executable(BitScopeAv1BlockSmoke
+        tests/av1blockprovider_smoke.cpp
+        src/bitstreamtypes.h
+        src/bitreader.h
+        src/bitstreamparser.h
+        src/bitstreamparser.cpp
+        src/av1blockprovider.h
+        src/av1blockprovider.cpp
+    )
+    target_include_directories(BitScopeAv1BlockSmoke PRIVATE src)
+    target_link_libraries(BitScopeAv1BlockSmoke PRIVATE Qt6::Core Qt6::Gui)
+    target_compile_definitions(BitScopeAv1BlockSmoke PRIVATE QT_NO_KEYWORDS)
+endif()

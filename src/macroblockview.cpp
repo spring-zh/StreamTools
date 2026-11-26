@@ -269,7 +269,16 @@ void MacroblockView::paintEvent(QPaintEvent *)
         }
     }
 
-    if (m_showQp && m_stream->codec == Codec::Hevc && frame.hevcCodingUnitsReady) {
+    if (m_showQp && m_stream->codec == Codec::Av1 && frame.av1CodingBlocksReady) {
+        painter.setPen(Qt::NoPen);
+        for (const auto &block : frame.av1CodingBlocks) {
+            if (block.qIndex < 0)
+                continue;
+            const int hue = std::clamp(220 - qRound(block.qIndex / 255.0 * 220.0), 0, 220);
+            painter.setBrush(QColor::fromHsv(hue, 205, 235, 92));
+            painter.drawRect(sourceRect(block.x, block.y, block.width, block.height, picture));
+        }
+    } else if (m_showQp && m_stream->codec == Codec::Hevc && frame.hevcCodingUnitsReady) {
         painter.setPen(Qt::NoPen);
         for (const auto &unit : frame.hevcCodingUnits) {
             if (unit.qp < 0)
@@ -321,6 +330,16 @@ void MacroblockView::paintEvent(QPaintEvent *)
                 painter.setBrush(Qt::NoBrush);
                 painter.drawRect(sourceRect(unit.x, unit.y, unit.width, unit.height, picture));
             }
+        } else if (m_stream->codec == Codec::Av1 && frame.av1CodingBlocksReady) {
+            for (const auto &block : frame.av1CodingBlocks) {
+                const bool intra = block.referenceFrames.contains(QStringLiteral("INTRA FRAME"));
+                QColor lineColor = intra ? QColor(255, 185, 90, 215)
+                                         : QColor(65, 220, 225, 200);
+                lineColor.setAlpha(std::clamp(145 + block.depth * 18, 145, 235));
+                painter.setPen(QPen(lineColor, block.depth >= 3 ? 0.75 : 1.1));
+                painter.setBrush(Qt::NoBrush);
+                painter.drawRect(sourceRect(block.x, block.y, block.width, block.height, picture));
+            }
         }
     }
 
@@ -331,7 +350,13 @@ void MacroblockView::paintEvent(QPaintEvent *)
         const QRectF startRect = unitRect(frame, column, row, picture);
         painter.drawLine(startRect.topLeft(), QPointF(picture.right(), startRect.top()));
     }
-    if (m_hoverCu >= 0 && m_hoverCu < frame.hevcCodingUnits.size()) {
+    if (m_stream->codec == Codec::Av1 && m_hoverCu >= 0
+        && m_hoverCu < frame.av1CodingBlocks.size()) {
+        const auto &block = frame.av1CodingBlocks.at(m_hoverCu);
+        painter.setPen(QPen(QColor("#ffffff"), 2));
+        painter.setBrush(QColor(25, 194, 201, 30));
+        painter.drawRect(sourceRect(block.x, block.y, block.width, block.height, picture));
+    } else if (m_hoverCu >= 0 && m_hoverCu < frame.hevcCodingUnits.size()) {
         const auto &unit = frame.hevcCodingUnits.at(m_hoverCu);
         painter.setPen(QPen(QColor("#ffffff"), 2));
         painter.setBrush(QColor(25, 194, 201, 30));
@@ -387,6 +412,16 @@ void MacroblockView::mouseMoveEvent(QMouseEvent *event)
                 break;
             }
         }
+    } else if (m_stream->codec == Codec::Av1 && frame.av1CodingBlocksReady) {
+        for (int index = 0; index < frame.av1CodingBlocks.size(); ++index) {
+            const auto &block = frame.av1CodingBlocks.at(index);
+            if (pixelX >= block.x && pixelX < block.x + block.width
+                && pixelY >= block.y && pixelY < block.y + block.height) {
+                m_hoverCu = index;
+                address = block.superblockAddress;
+                break;
+            }
+        }
     }
     const auto region = std::find_if(frame.regions.begin(), frame.regions.end(),
         [address](const CodingUnitRegion &candidate) {
@@ -402,6 +437,35 @@ void MacroblockView::mouseMoveEvent(QMouseEvent *event)
         ? QStringLiteral("当前帧 %1 未覆盖").arg(pictureUnit)
         : QStringLiteral("%1 #%2 · %3").arg(pictureUnit)
               .arg(region->sliceIndex).arg(region->type);
+    if (av1 && m_hoverCu >= 0 && m_hoverCu < frame.av1CodingBlocks.size()) {
+        const auto &block = frame.av1CodingBlocks.at(m_hoverCu);
+        const QString visibleSize = block.width == block.codedWidth
+                && block.height == block.codedHeight
+            ? QString()
+            : QStringLiteral(" · 可见裁剪 %1×%2").arg(block.width).arg(block.height);
+        QString reference = block.referenceFrames.isEmpty()
+            ? QStringLiteral("—") : block.referenceFrames;
+        if (!reference.contains(QStringLiteral("INTRA FRAME")))
+            reference += QStringLiteral(" · MV0(%1,%2) · MV1(%3,%4)")
+                .arg(block.motionVector0X).arg(block.motionVector0Y)
+                .arg(block.motionVector1X).arg(block.motionVector1Y);
+        Q_EMIT unitHovered(
+            QStringLiteral("AV1 Coding Block #%1 · Superblock %2 · 尺寸层级 %3 · 编码尺寸 %4×%5%6 · "
+                           "源像素 (%7, %8)–(%9, %10) · Y %11 · UV %12 · TX %13/%14 · "
+                           "QIndex %15 · Segment %16 · %17%18 · %19")
+                .arg(m_hoverCu).arg(block.superblockAddress).arg(block.depth)
+                .arg(block.codedWidth).arg(block.codedHeight).arg(visibleSize)
+                .arg(block.x).arg(block.y)
+                .arg(block.x + block.width - 1).arg(block.y + block.height - 1)
+                .arg(block.predictionMode, block.uvPredictionMode,
+                     block.transformSize, block.transformType)
+                .arg(block.qIndex).arg(block.segmentId)
+                .arg(reference)
+                .arg(block.skip ? QStringLiteral(" · Skip") : QString())
+                .arg(slice));
+        update();
+        return;
+    }
     if (m_hoverCu >= 0) {
         const auto &unitInfo = frame.hevcCodingUnits.at(m_hoverCu);
         const QString qp = unitInfo.qp >= 0
@@ -433,7 +497,9 @@ void MacroblockView::mouseMoveEvent(QMouseEvent *event)
         decoded = QStringLiteral("实际 QP %1 · %2 · 类型码 %3")
             .arg(unitInfo.qp).arg(unitInfo.category, unitInfo.decoderType);
     } else if (av1) {
-        decoded = QStringLiteral("AV1 根 Superblock；块级 QIndex/分区需要熵解码器导出");
+        decoded = frame.av1CodingBlocksError.isEmpty()
+            ? QStringLiteral("正在加载 AV1 实际 Coding Block")
+            : frame.av1CodingBlocksError;
     } else if (!frame.decodedUnitsError.isEmpty()) {
         decoded = frame.decodedUnitsError;
     } else {
@@ -445,10 +511,14 @@ void MacroblockView::mouseMoveEvent(QMouseEvent *event)
     const int sourceBottom = std::min(sourceY + frame.unitSize, m_stream->height);
     const int actualWidth = sourceRight - sourceX;
     const int actualHeight = sourceBottom - sourceY;
-    const QString partition = hevc
-        ? (frame.hevcCodingUnitsError.isEmpty()
-            ? QStringLiteral("· 正在加载该 CTU 内部 CU 四叉树")
-            : QStringLiteral("· %1").arg(frame.hevcCodingUnitsError))
+    const QString blockError = av1 ? frame.av1CodingBlocksError
+                                   : frame.hevcCodingUnitsError;
+    const QString partition = (hevc || av1)
+        ? (blockError.isEmpty()
+            ? (av1
+                ? QStringLiteral("· 正在加载该 Superblock 内部 Coding Block")
+                : QStringLiteral("· 正在加载该 CTU 内部 CU 四叉树"))
+            : QStringLiteral("· %1").arg(blockError))
         : QString();
     Q_EMIT unitHovered(
         QStringLiteral("%1 %2 · 列 %3 行 %4 · 当前尺寸 %5×%6 · 源像素 (%7, %8)–(%9, %10) · %11 · %12 %13")

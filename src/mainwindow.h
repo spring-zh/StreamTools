@@ -22,6 +22,7 @@ class QTreeWidgetItem;
 namespace bitscope {
 
 class FrameTableModel;
+class Av1BlockProvider;
 class HevcCuProvider;
 class MacroblockView;
 class PreviewProvider;
@@ -66,6 +67,7 @@ private:
     QSortFilterProxyModel *m_proxy = nullptr;
     PreviewProvider *m_previews = nullptr;
     HevcCuProvider *m_hevcCuProvider = nullptr;
+    Av1BlockProvider *m_av1BlockProvider = nullptr;
     QFutureWatcher<StreamPtr> m_watcher;
 
     QLabel *m_fileLabel = nullptr;

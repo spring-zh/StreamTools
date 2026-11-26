@@ -113,6 +113,31 @@ struct HevcCodingUnitInfo {
     int approximateBytes = -1;
 };
 
+struct Av1CodingBlockInfo {
+    int superblockAddress = -1;
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+    int codedWidth = 0;
+    int codedHeight = 0;
+    int depth = 0;
+    QString blockSize;
+    QString predictionMode;
+    QString uvPredictionMode;
+    QString transformSize;
+    QString transformType;
+    int qIndex = -1;
+    int segmentId = -1;
+    bool skip = false;
+    bool intraBlockCopy = false;
+    QString referenceFrames;
+    int motionVector0X = 0;
+    int motionVector0Y = 0;
+    int motionVector1X = 0;
+    int motionVector1Y = 0;
+};
+
 struct FrameInfo {
     int index = 0;
     int sampleIndex = -1;
@@ -142,6 +167,9 @@ struct FrameInfo {
     QVector<HevcCodingUnitInfo> hevcCodingUnits;
     bool hevcCodingUnitsReady = false;
     QString hevcCodingUnitsError;
+    QVector<Av1CodingBlockInfo> av1CodingBlocks;
+    bool av1CodingBlocksReady = false;
+    QString av1CodingBlocksError;
 };
 
 struct ParameterSetInfo {
