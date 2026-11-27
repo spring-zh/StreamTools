@@ -9,6 +9,7 @@
 #include "platformwindow.h"
 #include "previewprovider.h"
 #include "timelinewidget.h"
+#include "windowtitlebar.h"
 
 #include <QAction>
 #include <QApplication>
@@ -28,6 +29,7 @@
 #include <QItemSelectionModel>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
@@ -90,22 +92,6 @@ private:
     }
     QString m_needle;
     QString m_type;
-};
-
-class WindowTitleBar final : public QToolBar {
-public:
-    using QToolBar::QToolBar;
-
-protected:
-    void mousePressEvent(QMouseEvent *event) override
-    {
-        if (event->button() == Qt::LeftButton && window() && window()->windowHandle()
-            && window()->windowHandle()->startSystemMove()) {
-            event->accept();
-            return;
-        }
-        QToolBar::mousePressEvent(event);
-    }
 };
 
 QString formatBytes(qint64 bytes) {
@@ -341,6 +327,10 @@ void MainWindow::buildUi() {
     brand->setObjectName(QStringLiteral("brand"));
     brand->setAttribute(Qt::WA_TransparentForMouseEvents);
     topBar->addWidget(brand);
+#ifdef Q_OS_WIN
+    topBar->addTitleMenu(QStringLiteral("文件"))->setObjectName(QStringLiteral("titleFileMenu"));
+    topBar->addTitleMenu(QStringLiteral("视图"))->setObjectName(QStringLiteral("titleViewMenu"));
+#endif
     auto *titleSpacing = new QWidget(topBar);
     titleSpacing->setFixedWidth(12);
     titleSpacing->setAttribute(Qt::WA_TransparentForMouseEvents);
@@ -349,11 +339,18 @@ void MainWindow::buildUi() {
     m_fileLabel->setObjectName(QStringLiteral("fileLabel"));
     m_fileLabel->setAttribute(Qt::WA_TransparentForMouseEvents);
     m_fileLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+#ifdef Q_OS_WIN
+    // Long filenames must not push the window controls off the toolbar.
+    m_fileLabel->setMinimumWidth(1);
+#endif
     topBar->addWidget(m_fileLabel);
     auto *open = new QPushButton(QStringLiteral("打开码流…"), topBar);
     open->setObjectName(QStringLiteral("primaryButton"));
     connect(open, &QPushButton::clicked, this, &MainWindow::chooseFile);
     topBar->addWidget(open);
+#ifdef Q_OS_WIN
+    topBar->addWindowControls();
+#endif
 
     auto *metrics = new QHBoxLayout;
     m_codecMetric = metricLabel(QStringLiteral("编码"), central);
@@ -582,7 +579,13 @@ void MainWindow::buildUi() {
 }
 
 void MainWindow::buildMenus() {
+#ifdef Q_OS_WIN
+    auto *fileMenu = findChild<QMenu *>(QStringLiteral("titleFileMenu"));
+    auto *viewMenu = findChild<QMenu *>(QStringLiteral("titleViewMenu"));
+#else
     auto *fileMenu = menuBar()->addMenu(QStringLiteral("文件"));
+    auto *viewMenu = menuBar()->addMenu(QStringLiteral("视图"));
+#endif
     auto *open = fileMenu->addAction(QStringLiteral("打开码流…"));
     open->setShortcut(QKeySequence::Open);
     connect(open, &QAction::triggered, this, &MainWindow::chooseFile);
@@ -590,7 +593,6 @@ void MainWindow::buildMenus() {
     quit->setShortcut(QKeySequence::Quit);
     connect(quit, &QAction::triggered, this, &QWidget::close);
 
-    auto *viewMenu = menuBar()->addMenu(QStringLiteral("视图"));
     auto *frames = viewMenu->addAction(QStringLiteral("帧视图"));
     frames->setShortcut(QKeySequence(QStringLiteral("Ctrl+1")));
     connect(frames, &QAction::triggered, this, [this] { m_mode->setCurrentIndex(0); });
@@ -600,6 +602,10 @@ void MainWindow::buildMenus() {
     auto *boxes = viewMenu->addAction(QStringLiteral("MP4 文件视图"));
     boxes->setShortcut(QKeySequence(QStringLiteral("Ctrl+3")));
     connect(boxes, &QAction::triggered, this, [this] { if (m_mode->count() > 2) m_mode->setCurrentIndex(2); });
+    // Popup menus are normally hidden; also associate shortcuts with the main
+    // window so Ctrl+O / Ctrl+1..3 stay active without first opening a menu.
+    addActions(fileMenu->actions());
+    addActions(viewMenu->actions());
     auto *focusSearch = new QShortcut(QKeySequence(QStringLiteral("/")), this);
     connect(focusSearch, &QShortcut::activated, m_search, qOverload<>(&QWidget::setFocus));
 }
@@ -611,6 +617,9 @@ void MainWindow::applyTheme() {
         #appSurface { background:#0b1119; }
         #topBar { background:#0b1119; border:0; padding:0 10px; spacing:7px; }
         #brand { background:transparent; }
+        #titleMenuButton { background:transparent; color:#cdd8e4; border:0; border-radius:4px; padding:6px 12px; }
+        #titleMenuButton:hover, #titleMenuButton:pressed { background:#203346; color:#f4f8fc; }
+        #titleMenuButton::menu-indicator { image:none; width:0; }
         #windowClose, #windowMinimize, #windowZoom { border:0; border-radius:6px; padding:0; min-width:13px; max-width:13px; min-height:13px; max-height:13px; }
         #windowClose { background:#ff5f57; }
         #windowMinimize { background:#febc2e; }
@@ -652,6 +661,15 @@ void MainWindow::applyTheme() {
     m_frameStats->ensurePolished();
     m_frameStats->setFixedHeight(m_frameStats->fontMetrics().lineSpacing() * 3 + 16);
 }
+
+#ifdef Q_OS_WIN
+bool MainWindow::nativeEvent(const QByteArray &eventType, void *message, qintptr *result)
+{
+    if (handlePlatformWindowEvent(this, message, result))
+        return true;
+    return QMainWindow::nativeEvent(eventType, message, result);
+}
+#endif
 
 void MainWindow::chooseFile() {
     QSettings settings;

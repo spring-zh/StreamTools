@@ -8,6 +8,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Concurrent)
 qt_standard_project_setup()
+if(MSVC)
+    # All sources, including smoke tests, contain UTF-8 Chinese text.
+    add_compile_options(/utf-8)
+endif()
 # Some managed macOS installations protect CMake's compiler probe source.
 # MOC does not need those optional predefines for this project.
 set(CMAKE_AUTOMOC_COMPILER_PREDEFINES OFF)
@@ -15,6 +19,8 @@ set(CMAKE_AUTOMOC_COMPILER_PREDEFINES OFF)
 qt_add_executable(BitScopeQt
     src/main.cpp
     src/platformwindow.h
+    src/windowtitlebar.h
+    src/windowtitlebar.cpp
     src/bitstreamtypes.h
     src/bitreader.h
     src/bitstreamparser.h
@@ -40,6 +46,10 @@ if(APPLE)
     enable_language(OBJCXX)
     target_sources(BitScopeQt PRIVATE src/platformwindow_mac.mm)
     target_link_libraries(BitScopeQt PRIVATE "-framework Cocoa")
+endif()
+if(WIN32)
+    target_sources(BitScopeQt PRIVATE src/platformwindow_win.cpp)
+    target_link_libraries(BitScopeQt PRIVATE user32)
 endif()
 
 set(BITSCOPE_HEVC_ANALYZER "" CACHE FILEPATH
@@ -127,6 +137,31 @@ install(SCRIPT ${deploy_script})
 
 option(BITSCOPE_BUILD_TESTS "Build BitScope smoke-test helpers" OFF)
 if(BITSCOPE_BUILD_TESTS)
+    enable_testing()
+    qt_add_executable(BitScopeWindowChromeTest
+        tests/windowchrome_test.cpp
+        src/windowtitlebar.h
+        src/windowtitlebar.cpp
+    )
+    if(WIN32)
+        target_sources(BitScopeWindowChromeTest PRIVATE src/platformwindow_win.cpp)
+        target_link_libraries(BitScopeWindowChromeTest PRIVATE user32)
+    endif()
+    target_include_directories(BitScopeWindowChromeTest PRIVATE src)
+    target_link_libraries(BitScopeWindowChromeTest PRIVATE Qt6::Widgets)
+    target_compile_definitions(BitScopeWindowChromeTest PRIVATE QT_NO_KEYWORDS)
+    add_test(NAME window-chrome COMMAND BitScopeWindowChromeTest)
+
+    qt_add_executable(BitScopeMacroblockLogTest
+        tests/macroblocklog_test.cpp
+        src/previewprovider.h
+        src/previewprovider.cpp
+    )
+    target_include_directories(BitScopeMacroblockLogTest PRIVATE src)
+    target_link_libraries(BitScopeMacroblockLogTest PRIVATE Qt6::Core Qt6::Gui)
+    target_compile_definitions(BitScopeMacroblockLogTest PRIVATE QT_NO_KEYWORDS)
+    add_test(NAME macroblock-log-parser COMMAND BitScopeMacroblockLogTest)
+
     qt_add_executable(BitScopeAv1BlockSmoke
         tests/av1blockprovider_smoke.cpp
         src/bitstreamtypes.h

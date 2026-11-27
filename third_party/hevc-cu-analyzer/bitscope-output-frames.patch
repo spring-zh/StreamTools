@@ -1,14 +1,27 @@
 diff --git a/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.cpp b/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.cpp
 --- a/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.cpp
 +++ b/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.cpp
-@@ -1,2 +1,4 @@
+@@ -1,5 +1,8 @@
  #include "TSysuAnalyzerOutput.h"
+
 +#include <cstdlib>
 +#include <sstream>
- 
-@@ -17,0 +21,1 @@
++
+ TSysuAnalyzerOutput* TSysuAnalyzerOutput::m_instance = NULL;
+
+ TSysuAnalyzerOutput::TSysuAnalyzerOutput()
+@@ -15,6 +18,7 @@ TSysuAnalyzerOutput::TSysuAnalyzerOutput()
+   m_cMEOutput.open   ("encoder_me.txt",   ios::out);
+   m_cBitOutputLCU.open  ("decoder_bit_lcu.txt",  ios::out);
+   m_cBitOutputSCU.open  ("decoder_bit_scu.txt",  ios::out);
 +  m_cQPOutput.open      ("decoder_qp.txt",       ios::out);
-@@ -24,0 +29,16 @@
+
+   m_cTileOutPut.open("decoder_tile.txt", ios::out);
+
+@@ -23,9 +27,31 @@ TSysuAnalyzerOutput::TSysuAnalyzerOutput()
+   m_uiCUStartByte   = 0;
+   m_bYuvFilesOpened = false;
+
 +  m_iPictureIndex = -1;
 +  const char* pchOutputFrames = std::getenv("BITSCOPE_HEVC_OUTPUT_FRAMES");
 +  if( pchOutputFrames != NULL )
@@ -25,31 +38,80 @@ diff --git a/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.cpp
 +    }
 +  }
 +
-@@ -27,0 +50,6 @@
+
+ }
+
 +Bool TSysuAnalyzerOutput::shouldWriteFrame( TComDataCU* pcCU )
 +{
 +  if( pcCU->getCtuRsAddr() == 0 ) ++m_iPictureIndex;
 +  return m_aiOutputFrames.empty() || m_aiOutputFrames.find( m_iPictureIndex ) != m_aiOutputFrames.end();
 +}
 +
-@@ -65,0 +95,1 @@
+
+ //write out tile info
+ void TSysuAnalyzerOutput::writeOutTileInfo(TComPic * pcPic)
+@@ -63,6 +89,7 @@ void TSysuAnalyzerOutput::writeOutTileInfo(TComPic * pcPic)
+ void TSysuAnalyzerOutput::writeOutCUInfo   ( TComDataCU* pcCU )
+ {
+   Int iPoc = pcCU->getSlice()->getPOC();
 +  if( !shouldWriteFrame( pcCU ) ) return;
-@@ -77,0 +107,1 @@
-+  m_cQPOutput << "<" << iPoc << "," << iAddr << ">" << " ";
-@@ -92,0 +123,1 @@
+   Int iAddr = pcCU->getCtuRsAddr();
+   Int iTotalNumPart = pcCU->getTotalNumPart();
+
+@@ -75,3 +102,4 @@ void TSysuAnalyzerOutput::writeOutCUInfo   ( TComDataCU* pcCU )
+   m_cTUOutput   << "<" << iPoc << "," << iAddr << ">" << " ";  ///< Write out TU mode info
++  m_cQPOutput << "<" << iPoc << "," << iAddr << ">" << " ";  ///< Write out leaf CU QP
+   m_cBitOutputLCU << "<" << iPoc << "," << iAddr << ">" << " ";  ///< Write out bit info
+   m_cBitOutputSCU << "<" << iPoc << "," << iAddr << ">" << " ";  ///< Write out bit info
+@@ -90,6 +118,7 @@ void TSysuAnalyzerOutput::writeOutCUInfo   ( TComDataCU* pcCU )
+   m_cTUOutput   << endl;
+   m_cBitOutputLCU  << endl;
+   m_cBitOutputSCU  << endl;
 +  m_cQPOutput << endl;
-@@ -108,0 +140,1 @@
+   m_cMEOutput   << endl;
+ }
+
+@@ -106,6 +135,7 @@ void TSysuAnalyzerOutput::xWriteOutCUInfo  ( TComDataCU* pcCU, Int iLength, Int
+     ///< CU PU info
+     ///< HM-16+ marks "no partition" with NUMBER_OF_PART_SIZES instead of SIZE_NONE (15)
+     m_cCUPUOutput << ( puhPartSize[iOffset] == NUMBER_OF_PART_SIZES ? 15 : (Int)(puhPartSize[iOffset]) ) << " ";
 +    m_cQPOutput << (puhPartSize[iOffset] == NUMBER_OF_PART_SIZES ? -1 : pcCU->getQP(iOffset)) << " ";
+
+     ///< TU info
+     xWriteOutTUInfo  ( pcCU, iLength, iOffset, 0 );   ///< Recursive write TU
 diff --git a/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.h b/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.h
 --- a/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.h
 +++ b/appgitlhevcdecoder/HM_18.0/TLibSysuAnalyzer/TSysuAnalyzerOutput.h
-@@ -11,0 +12,1 @@
+@@ -9,6 +9,7 @@
+ #include "TLibDecoder/TDecCu.h"
+
+ #include <map>
 +#include <set>
-@@ -83,0 +85,2 @@
+ #include "TLibCommon/TComPic.h"
+ #include "TLibCommon/TComPicYuv.h"
+ #include "TLibCommon/TComBitStream.h"
+@@ -81,6 +82,8 @@ public:
+   static TSysuAnalyzerOutput* getInstance() { if( m_instance == NULL ) m_instance = new TSysuAnalyzerOutput(); return m_instance;}
+
+ private:
 +  Bool shouldWriteFrame ( TComDataCU* pcCU );
 +
-@@ -94,0 +98,1 @@
-+  std::ofstream m_cQPOutput;
-@@ -108,0 +113,2 @@
+
+   /// Decoder output ( extracted from bitstream )
+   std::ofstream m_cSpsOut;          ///< SPS info
+@@ -92,6 +95,7 @@ private:
+   std::ofstream m_cTUOutput;        ///< TU info output
+   std::ofstream m_cBitOutputLCU;    ///< LCU bit consumption info output
+   std::ofstream m_cBitOutputSCU;    ///< SCU bit consumption info output
++  std::ofstream m_cQPOutput;        ///< leaf CU luma QP output
+   std::ofstream m_cTileOutPut;
+
+   /// Encoder output ( extracted in the encoding process
+@@ -106,5 +110,7 @@ private:
+   TVideoIOYuv         m_cPredYuvFile;
+   TVideoIOYuv         m_cResiYuvFile;
+   Bool                m_bYuvFilesOpened;
 +  std::set<Int>       m_aiOutputFrames;
 +  Int                 m_iPictureIndex;
+
+   static TSysuAnalyzerOutput* m_instance;

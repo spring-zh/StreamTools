@@ -112,13 +112,79 @@ macOS 可运行 `build/BitScope.app`，Linux 通常运行 `build/BitScope`。也
 
 ### Windows
 
-在安装 Qt 6 的开发者命令行中执行：
+#### GitHub Actions 自动编译、打包（Mac 上也能操作）
+
+已提供 `.github/workflows/windows-build.yml`，使用 GitHub 的 `windows-2022` x64 环境，
+安装 Qt 6.8.3 MSVC x64 和 NASM，并调用与本地相同的 `package-windows.ps1`。
+无需在 Mac 安装 Windows，也不需要配置额外的仓库 Secret 或个人访问令牌。
+
+1. 将本项目源码（包括 `.github`、`scripts`、`third_party`、`tests`）提交并推送到自己的 GitHub 仓库。
+   不要上传 `build*`、`dist` 或测试视频。
+2. 打开仓库的 **Actions → Windows x64 build and package → Run workflow**。
+   首次使用时，工作流文件要先合入默认分支，网页才会显示手动运行按钮。
+3. 选择分支并运行。成功后打开该次运行页面，在 **Artifacts** 下载 `BitScope-windows-x64-运行编号`。
+4. 解压下载的 artifact，再解压其中的 `BitScope-windows-x64.zip`，保留完整 `BitScope` 文件夹。
+5. 在 Windows 10/11 x64 上运行 `BitScope.exe`。干净电脑可能需要先运行
+   `prerequisites/VC_redist.x64.exe` 安装微软 C++ x64 运行库。
+
+工作流还会在 `main/master` 上的相关代码变更和 `v*` 标签推送时运行。
+只上传构建产物，不创建 GitHub Release、不推送代码；权限仅 `contents: read`。
+仓库或组织如限制 Actions，需要允许工作流引用的 `actions/*` 和 `jurplel/install-qt-action`。
+Actions 引用固定提交 SHA，两个分析器源码固定提交，FFmpeg 固定版本并校验 SHA-256。
+测试失败不会上传“成功包”，仅保留构建诊断；默认 artifact 保存 14 天。
+
+自动检查包括：PowerShell 语法/参数与 x64 格式检查、主程序启动、四种编码的合成视频预览、
+H.265 CU 和 AV1 Coding Block 提取、界面截图。测试文件在构建时生成，不使用个人视频。
+运行检查把程序复制到新路径，并从 PATH 移除 Qt/编译工具；这不能代替真实干净 Windows 电脑的验收。
+
+#### Windows 本地一键打包
+
+安装 Visual Studio 2022（C++ 桌面开发和 Windows SDK）、Qt 的 `msvc2022_64` 组件、
+CMake 3.21+、Git、PowerShell 7 和 NASM。确保 `cmake`、`git`、`nasm` 在 PATH 中。
+在 **PowerShell 7** 中执行（替换 Qt 路径）：
 
 ```powershell
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release --parallel
-cmake --install build --config Release --prefix dist
+pwsh -NoProfile -File .\package-windows.ps1 -QtPrefix C:\Qt\6.8.3\msvc2022_64
 ```
+
+脚本默认自动下载/构建缺失的视频分析工具：
+
+- `scripts/build-windows-deps.ps1`：获取固定提交的 Gitl/HM、libaom，应用项目补丁并编译，
+  下载校验过的 FFmpeg 8.0.1 essentials Windows x64 静态版本。
+- `scripts/hevc-helper/CMakeLists.txt`：只构建 HEVC 参考解码/分析器，不构建上游 Qt GUI。
+- `package-windows.ps1`：编译主程序，通过 `windeployqt` 部署 Qt，复制辅助工具和声明，
+  下载并验证微软签名的 VC++ 运行库安装器，测试后输出文件夹和 ZIP。
+- `scripts/test-windows-package.ps1`：运行实际视频/块解析测试。
+
+每次输出到新的 `dist/BitScope-windows-x64-时间-随机后缀/`，不覆盖旧包。
+里面的 `BitScope/` 是完整应用目录，`BitScope-windows-x64.zip` 是分发包，
+`build-manifest.json` 记录源提交、文件哈希和测试状态。
+如仍有 `INCOMPLETE.txt`，说明打包中断或失败，不能当作成品分发。
+
+已有 Windows x64 分析工具时，可以全部显式指定，跳过下载/构建分析器：
+
+```powershell
+pwsh -File .\package-windows.ps1 `
+  -QtPrefix C:\Qt\6.8.3\msvc2022_64 `
+  -FFmpeg C:\tools\ffmpeg\bin\ffmpeg.exe `
+  -HevcAnalyzer C:\tools\HM_180.exe `
+  -Av1Inspect C:\tools\av1inspect.exe `
+  -VcRedist C:\tools\VC_redist.x64.exe
+```
+
+分析器必须包含本项目补丁；脚本不接受 macOS、ARM64 或 x86 二进制。
+显式提供的共享库构建会复制工具同目录 DLL，遇到同名不同内容的 DLL 会报错。
+主程序和 Qt 库仍需 MSVC 2022 x64 兼容，不能混用 MinGW 库。
+`-SkipTests` 仅用于排查，生成清单会标记未测试；Actions 不使用此选项。
+
+首次准备依赖需要访问 GitHub、Qt 下载站、AOM、HM 上游和微软下载站。
+依赖构建保留在 `build-windows-deps`，不会改动用户已有源码目录。
+程序默认未做 Windows 代码签名；公开分发前请按实际依赖的许可证补齐相关许可与源码材料，
+并在 Windows 实机上验证。本项目随附的 FFmpeg 包是第三方 GPL 构建。
+
+参考：[Qt Windows 部署](https://doc.qt.io/qt-6/windows-deployment.html)、
+[GitHub 手动运行工作流](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)、
+[FFmpeg Windows 构建来源](https://www.gyan.dev/ffmpeg/builds/)。
 
 预览功能会按顺序查找：`BITSCOPE_FFMPEG` 环境变量、程序同目录的 `ffmpeg` / `ffmpeg.exe`、macOS Homebrew/MacPorts 常用目录、Linux 常用目录以及系统 `PATH`。因此从 Finder 双击启动也能识别 `/opt/homebrew/bin/ffmpeg`。没有 FFmpeg 时，码流和语法分析仍可正常使用，画面区域会显示明确的安装提示。
 

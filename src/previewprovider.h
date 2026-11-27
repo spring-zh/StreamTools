@@ -36,6 +36,7 @@ private Q_SLOTS:
     void processError(QProcess::ProcessError error);
 
 private:
+    friend struct PreviewProviderLogTest;
     int nearestStart(int frameIndex) const;
     QByteArray accessUnit(int frameIndex, bool includeParameters) const;
     QByteArray segment(int first, int last) const;

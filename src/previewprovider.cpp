@@ -29,9 +29,10 @@ namespace {
 
 QString decodedUnitCategory(const QString &code)
 {
-    if (code.contains(QLatin1Char('I')) || code.contains(QLatin1Char('i')))
+    if (code.contains(QLatin1Char('I')) || code.contains(QLatin1Char('i'))
+        || code.contains(QLatin1Char('A')) || code.contains(QLatin1Char('P')))
         return QStringLiteral("帧内预测");
-    if (code.contains(QLatin1Char('S')))
+    if (code.contains(QLatin1Char('S')) || code.contains(QLatin1Char('g')))
         return QStringLiteral("跳过");
     if (code.contains(QLatin1Char('X')) || code.contains(QLatin1Char('d'))
         || code.contains(QLatin1Char('D')))
@@ -40,6 +41,8 @@ QString decodedUnitCategory(const QString &code)
         return QStringLiteral("反向预测");
     if (code.contains(QLatin1Char('>')))
         return QStringLiteral("前向预测");
+    if (code.contains(QLatin1Char('G')))
+        return QStringLiteral("全局运动预测");
     return QStringLiteral("其他");
 }
 
@@ -124,17 +127,23 @@ void PreviewProvider::processQueue(){if(!m_stream||m_pending.isEmpty()||m_proces
             m_activeOutputOrder.push_back(index);
     }
     if(m_stream->containerFile
-        && (m_stream->codec==Codec::Avc||m_stream->codec==Codec::Hevc
-            ||m_stream->codec==Codec::Mpeg4Visual))
+        && (m_stream->codec==Codec::Avc||m_stream->codec==Codec::Hevc))
         std::stable_sort(m_activeOutputOrder.begin(),m_activeOutputOrder.end(),[this](int a,int b){return m_stream->frames.at(a).pts<m_stream->frames.at(b).pts;});
     const QString suffix=m_stream->codec==Codec::Avc?QStringLiteral("h264"):(m_stream->codec==Codec::Hevc?QStringLiteral("h265"):(m_stream->codec==Codec::Mpeg4Visual?QStringLiteral("m4v"):QStringLiteral("obu")));
     const int job=m_job++;m_activePrefix=QDir(m_temp.path()).filePath(QStringLiteral("preview_%1_").arg(job));m_activeInput=QDir(m_temp.path()).filePath(QStringLiteral("preview_%1.%2").arg(job).arg(suffix));QFile input(m_activeInput);if(!input.open(QIODevice::WriteOnly)){for(int index:m_activeRequested)Q_EMIT previewFailed(index,input.errorString());if(!m_pending.isEmpty())m_queueTimer.start();else Q_EMIT queueIdle();return;}input.write(segment(m_activeStart,m_activeEnd));input.close();
     const QString output=m_activePrefix+QStringLiteral("%05d.jpg");const QString fps=QString::number(m_stream->fps,'f',3);
     const bool macroblockDebug=m_stream->codec==Codec::Avc||m_stream->codec==Codec::Mpeg4Visual;
-    QStringList args{QStringLiteral("-hide_banner"),QStringLiteral("-loglevel"),macroblockDebug?QStringLiteral("debug"):QStringLiteral("error")};
+    // Progress output uses carriage returns and can share a line with MB logs.
+    QStringList args{QStringLiteral("-hide_banner"),QStringLiteral("-nostats"),QStringLiteral("-loglevel"),macroblockDebug?QStringLiteral("repeat+debug"):QStringLiteral("error")};
     if(macroblockDebug)args<<QStringLiteral("-threads")<<QStringLiteral("1")<<QStringLiteral("-debug")<<QStringLiteral("qp+mb_type")<<QStringLiteral("-probesize")<<QStringLiteral("32")<<QStringLiteral("-analyzeduration")<<QStringLiteral("0");
+    // MPEG-4's delayed EOF output omits ff_print_debug_info in FFmpeg 8.
+    // Request each decoded picture immediately (including B pictures), retaining
+    // reference decoding but mapping BOTH JPEGs and MB logs in input/coded order.
+    // Do not PTS-sort m_activeOutputOrder for this codec above.
+    const QString decoderFlags = m_stream->codec == Codec::Mpeg4Visual
+        ? QStringLiteral("+output_corrupt+low_delay") : QStringLiteral("+output_corrupt");
     const QString demuxer=m_stream->codec==Codec::Avc?QStringLiteral("h264"):(m_stream->codec==Codec::Hevc?QStringLiteral("hevc"):(m_stream->codec==Codec::Mpeg4Visual?QStringLiteral("m4v"):QStringLiteral("obu")));
-    args<<QStringLiteral("-fflags")<<QStringLiteral("+genpts")<<QStringLiteral("-err_detect")<<QStringLiteral("ignore_err")<<QStringLiteral("-flags")<<QStringLiteral("+output_corrupt")<<QStringLiteral("-r")<<fps<<QStringLiteral("-f")<<demuxer<<QStringLiteral("-i")<<m_activeInput<<QStringLiteral("-an")<<QStringLiteral("-vf")<<QStringLiteral("scale=320:-2")<<QStringLiteral("-fps_mode")<<QStringLiteral("passthrough")<<QStringLiteral("-q:v")<<QStringLiteral("5")<<QStringLiteral("-start_number")<<QStringLiteral("0")<<QStringLiteral("-frames:v")<<QString::number(m_activeOutputOrder.size())<<QStringLiteral("-y")<<output;
+    args<<QStringLiteral("-fflags")<<QStringLiteral("+genpts")<<QStringLiteral("-err_detect")<<QStringLiteral("ignore_err")<<QStringLiteral("-flags")<<decoderFlags<<QStringLiteral("-r")<<fps<<QStringLiteral("-f")<<demuxer<<QStringLiteral("-i")<<m_activeInput<<QStringLiteral("-an")<<QStringLiteral("-vf")<<QStringLiteral("scale=320:-2")<<QStringLiteral("-fps_mode")<<QStringLiteral("passthrough")<<QStringLiteral("-q:v")<<QStringLiteral("5")<<QStringLiteral("-start_number")<<QStringLiteral("0")<<QStringLiteral("-frames:v")<<QString::number(m_activeOutputOrder.size())<<QStringLiteral("-y")<<output;
     Q_EMIT statusChanged(QStringLiteral("正在生成预览 F%1–F%2 · %3").arg(m_activeStart).arg(m_activeEnd).arg(executable));m_process.start(executable,args);
 }
 
@@ -218,68 +227,99 @@ QVector<QVector<DecodedUnitInfo>> PreviewProvider::parseAvcDecodedUnits(const QB
     if (columns <= 0 || rows <= 0)
         return result;
 
-    const QRegularExpression framePattern(
-        QStringLiteral("^\\[(?:h264|mpeg4) @ (0x[0-9a-fA-F]+)\\] New frame, type:"));
-    const QRegularExpression rowPattern(
-        QStringLiteral("^\\[(?:h264|mpeg4) @ (0x[0-9a-fA-F]+)\\]\\s+(\\d+)\\s+(.+)$"));
-    const QRegularExpression cellPattern(QStringLiteral("^(\\d{1,2})(.+)$"));
-    const QRegularExpression whitespace(QStringLiteral("\\s+"));
+    // FFmpeg formats contexts with %p: Windows may omit the POSIX 0x prefix.
+    const QString prefix = QStringLiteral("\\[(?:h264|mpeg4) @ ((?:0[xX])?[0-9a-fA-F]+)\\]");
+    const QRegularExpression contextPattern(prefix);
+    const QRegularExpression framePattern(prefix + QStringLiteral(" New frame, type:"));
+    // qp+mb_type emits exactly 5 columns per MB, not whitespace-separated
+    // tokens. In particular, interlaced partitions can have no separator.
+    const QRegularExpression typePattern(QStringLiteral("^[PiIAdDgGS<>X][ +|?\\-][ =]$"));
+    const QRegularExpression rowPattern(QStringLiteral(
+        "(?:^|\\s)(\\d+) ((?:[ 0-9]{2}[PiIAdDgGS<>X][ +|?\\-][ =]){%1})$").arg(columns));
+    const int minimumValid = std::max(1, (columns * rows + 1) / 2);
     QHash<QString, QVector<DecodedFrameBlock>> blocks;
     QHash<QString, int> current;
     QHash<QString, int> lastSerial;
     int serial = 0;
+    bool pendingFrameHeader = false;
+    QString lastContext;
+    const QRegularExpression unprefixedFramePattern(QStringLiteral("New frame, type: [IPB]"));
+    const auto startBlock = [&](const QString &context) {
+        DecodedFrameBlock block;
+        block.units.resize(columns * rows);
+        for (int address = 0; address < block.units.size(); ++address) {
+            block.units[address].address = address;
+            block.units[address].column = address % columns;
+            block.units[address].row = address / columns;
+        }
+        block.serial = serial++;
+        blocks[context].push_back(std::move(block));
+        current[context] = blocks[context].size() - 1;
+        lastSerial[context] = serial;
+        pendingFrameHeader = false;
+    };
 
     const QStringList lines = QString::fromLocal8Bit(log).split(QLatin1Char('\n'));
     for (const QString &rawLine : lines) {
-        const QString line = rawLine.trimmed();
+        QString line = rawLine;
+        if (line.endsWith(QLatin1Char('\r')))
+            line.chop(1); // Preserve the fixed-width cell padding.
+        const auto contextMatch = contextPattern.match(line);
+        if (contextMatch.hasMatch())
+            lastContext = contextMatch.captured(1);
         const auto frameMatch = framePattern.match(line);
         if (frameMatch.hasMatch()) {
-            const QString context = frameMatch.captured(1);
-            DecodedFrameBlock block;
-            block.units.resize(columns * rows);
-            for (int address = 0; address < block.units.size(); ++address) {
-                block.units[address].address = address;
-                block.units[address].column = address % columns;
-                block.units[address].row = address / columns;
-            }
-            block.serial = serial++;
-            blocks[context].push_back(std::move(block));
-            current[context] = blocks[context].size() - 1;
-            lastSerial[context] = serial;
+            startBlock(frameMatch.captured(1));
+            continue;
+        }
+        // FFmpeg's log prefix state is global. A partial filter diagnostic can
+        // suppress the context prefix of the next decoder message. Bind such
+        // a frame header to the next validated MB row, not to a guessed pointer.
+        if (unprefixedFramePattern.match(line).hasMatch()) {
+            pendingFrameHeader = true;
             continue;
         }
 
         const auto rowMatch = rowPattern.match(line);
         if (!rowMatch.hasMatch())
             continue;
-        const QString context = rowMatch.captured(1);
-        if (!current.contains(context))
+        // Decoder threads are forced to one. A row without its prefix belongs
+        // to the last decoder context; require a full fixed-width grid row so
+        // unrelated filter/progress messages cannot become macroblock data.
+        const QString context = lastContext;
+        if (context.isEmpty())
             continue;
         bool rowOk = false;
-        const int pixelY = rowMatch.captured(2).toInt(&rowOk);
+        const int pixelY = rowMatch.captured(1).toInt(&rowOk);
         if (!rowOk || pixelY % 16 != 0)
             continue;
         const int row = pixelY / 16;
         if (row < 0 || row >= rows)
             continue;
-        const QStringList cells = rowMatch.captured(3).trimmed().split(whitespace, Qt::SkipEmptyParts);
-        if (cells.size() < columns)
+        const QString cells = rowMatch.captured(2);
+        if (cells.size() < columns * 5)
             continue;
+        if (!typePattern.match(cells.mid(2, 3)).hasMatch())
+            continue; // Column-coordinate heading, not a macroblock row.
+        if (pendingFrameHeader || !current.contains(context)
+            || (row == 0 && blocks[context][current[context]].units[0].qp >= 0))
+            startBlock(context);
 
         auto &block = blocks[context][current[context]];
         for (int column = 0; column < columns; ++column) {
-            const auto cellMatch = cellPattern.match(cells.at(column));
-            if (!cellMatch.hasMatch())
+            const QString cell = cells.mid(column * 5, 5);
+            const QString type = cell.mid(2, 3);
+            if (!typePattern.match(type).hasMatch())
                 continue;
             bool qpOk = false;
-            const int qp = cellMatch.captured(1).toInt(&qpOk);
+            const int qp = cell.left(2).trimmed().toInt(&qpOk);
             if (!qpOk || qp < 0 || qp > 51)
                 continue;
             DecodedUnitInfo &unit = block.units[row * columns + column];
             if (unit.qp < 0)
                 ++block.validCount;
             unit.qp = qp;
-            unit.decoderType = cellMatch.captured(2);
+            unit.decoderType = type.trimmed();
             unit.category = decodedUnitCategory(unit.decoderType);
         }
     }
@@ -290,7 +330,7 @@ QVector<QVector<DecodedUnitInfo>> PreviewProvider::parseAvcDecodedUnits(const QB
     for (auto it = blocks.cbegin(); it != blocks.cend(); ++it) {
         int validBlocks = 0;
         for (const auto &block : it.value())
-            if (block.validCount >= columns * rows / 2)
+            if (block.validCount >= minimumValid)
                 ++validBlocks;
         if (validBlocks > bestCount || (validBlocks == bestCount && lastSerial.value(it.key()) > bestSerial)) {
             bestContext = it.key();
@@ -301,9 +341,10 @@ QVector<QVector<DecodedUnitInfo>> PreviewProvider::parseAvcDecodedUnits(const QB
     if (bestContext.isEmpty())
         return result;
     for (const auto &block : blocks.value(bestContext)) {
-        if (block.validCount < columns * rows / 2)
-            continue;
-        result.push_back(block.units);
+        // Keep a slot for missing frame data; compacting the list would assign
+        // the following picture's QP and MB types to the wrong preview.
+        result.push_back(block.validCount >= minimumValid
+                             ? block.units : QVector<DecodedUnitInfo>{});
         if (result.size() >= expectedFrames)
             break;
     }
