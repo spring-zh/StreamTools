@@ -6,6 +6,66 @@
 
 需要 Qt 6.5 或更高版本、CMake 3.21 或更高版本，以及用于生成帧预览的 FFmpeg。
 
+### macOS 一键编译、独立打包
+
+在项目根目录执行（也可在 Finder 双击 `package-macos.command`）：
+
+```bash
+./package-macos.command
+```
+
+打包电脑需要 Xcode Command Line Tools、CMake、Python 3.9+、Qt 6.5+（含 `macdeployqt`）、FFmpeg，
+以及带本项目补丁的 HEVC `HM_180` 和 AV1 `inspect`。目标电脑不需要这些开发环境。
+脚本会优先读取显式参数/环境变量，其次从已有的 `build-qt`、`build` 和专用打包构建目录查找分析器；
+最后查询 PATH。全新源码克隆不包含分析器二进制，需要先按下方说明编译分析器。
+
+需要指定依赖时：
+
+```bash
+./package-macos.command \
+  --qt-prefix /opt/homebrew/opt/qt \
+  --ffmpeg /opt/homebrew/bin/ffmpeg \
+  --hevc-analyzer /path/to/HM_180 \
+  --av1-inspect /path/to/inspect
+```
+
+也支持 `BITSCOPE_FFMPEG`、`BITSCOPE_HEVC_ANALYZER`、`BITSCOPE_AV1_INSPECT` 环境变量。
+使用 `--help` 查看全部参数。
+
+每次生成一个新的 `dist/BitScope-macOS-架构-时间-随机后缀/`，不覆盖旧包：
+
+- `BitScope.app`：独立运行应用，包含 Qt、FFmpeg 及其动态库、两种详细块分析器。
+- `BitScope.zip`：可传输的应用压缩包，保留应用结构和符号链接。
+- `使用说明.txt`：适用架构、最低 macOS 版本、签名和使用说明。
+- `build-manifest.json`、`deployment.log`：依赖审计和部署日志，包含构建机路径，不必发给最终用户。
+- 如仍有 `INCOMPLETE.txt`，说明打包失败或尚未结束，**不要分发**。
+
+脚本在 `build-macos-package-arm64` 或 `build-macos-package-x86_64` 单独构建，
+递归部署依赖，将加载路径改为应用内相对路径，检查所有 Mach-O 文件的架构和最低系统版本，
+执行签名校验，并在不含 Homebrew 的 PATH 下进行启动检查。
+最低系统要求取主程序、Qt、FFmpeg 和所有动态库的最大值，不能只降低主程序编译选项来支持旧系统。
+
+默认只生成当前架构版本：Apple Silicon 对应 `arm64`，Intel 对应 `x86_64`，不是通用二进制。
+要构建另一架构，使用 `--arch x86_64` 或 `--arch arm64`，同时提供对应架构的 Qt 和全部辅助程序/动态库；
+建议在相应架构的 Mac 上分别构建和测试。
+
+默认采用 ad-hoc 签名，**不等于 Apple 开发者签名或公证**，网络下载后仍可能被 Gatekeeper 拦截。
+只对确认来源可信的应用，通过“系统设置 → 隐私与安全性”允许打开；不要关闭系统安全保护。
+有 Developer ID Application 证书时可运行：
+
+```bash
+./package-macos.command --sign-identity 'Developer ID Application: Your Name (TEAMID)'
+```
+
+此参数启用 hardened runtime 和时间戳，但不会自动上传应用公证。
+面向公众分发应另行完成 Apple 公证、staple，再重新生成 ZIP。
+参考 [Qt macOS 部署文档](https://doc.qt.io/qt-6/macos-deployment.html) 和
+[Apple 公证文档](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)。
+
+脚本收集项目自带的第三方声明/补丁和本机依赖包可找到的许可证、安装清单；这并非完整的发行许可审查。
+公开或商业发行前，需按实际 Qt/FFmpeg 构建配置及依赖许可证补齐相关许可/源码材料。
+发布前还应在没有 Qt/Homebrew 的干净 Mac 上，实际验证各格式预览和块分析。
+
 ### macOS / Linux
 
 ```bash

@@ -31,6 +31,7 @@ Makefile
 *.tmp
 *.temp
 .cache/
+__pycache__/
 
 # Packaging placeholder accidentally produced by local scripts
 {{HOMEBREW_PREFIX}}/
