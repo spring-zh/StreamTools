@@ -451,6 +451,7 @@ Av1BlockParseResult Av1BlockProvider::parseOutput(const QByteArray &data,
                 block.referenceFrames = refText.join(QStringLiteral(" + "));
                 const Cell vectors = gridCell(motionVectors, row, column);
                 if (vectors.size() >= 4) {
+                    block.motionVectorsAvailable = true;
                     block.motionVector0X = vectors.at(0);
                     block.motionVector0Y = vectors.at(1);
                     block.motionVector1X = vectors.at(2);

@@ -47,8 +47,13 @@ struct SliceInfo {
     QString type = QStringLiteral("?");
     int rawType = -1;
     int ppsId = -1;
+    int entropyCoding = -1; // Snapshot of the active AVC PPS; -1 means unavailable.
     int frameNum = -1;
     int poc = -1;
+    bool pocValid = false;
+    int pocLsb = -1;
+    int pocBits = 0;
+    bool dependentSlice = false;
     int qpDelta = 0;
     int numRefL0 = 0;
     int numRefL1 = 0;
@@ -98,6 +103,17 @@ struct DecodedUnitInfo {
     QString category;
 };
 
+struct MotionVectorInfo {
+    int list = 0;
+    int predictionUnit = -1;
+    int referencePoc = 0; // Used only for HEVC vectors from HM.
+    int centerX = 0, centerY = 0;
+    int width = 0, height = 0;
+    int motionX = 0, motionY = 0, scale = 1;
+    double dx() const { return double(motionX) / scale; }
+    double dy() const { return double(motionY) / scale; }
+};
+
 struct HevcCodingUnitInfo {
     int ctuAddress = -1;
     int x = 0;
@@ -111,6 +127,9 @@ struct HevcCodingUnitInfo {
     QString prediction;
     int qp = -1;
     int approximateBytes = -1;
+    QVector<MotionVectorInfo> motionVectors;
+    bool motionVectorsReady = false;
+    QString motionVectorsError;
 };
 
 struct Av1CodingBlockInfo {
@@ -136,6 +155,7 @@ struct Av1CodingBlockInfo {
     int motionVector0Y = 0;
     int motionVector1X = 0;
     int motionVector1Y = 0;
+    bool motionVectorsAvailable = false;
 };
 
 struct FrameInfo {
@@ -157,6 +177,9 @@ struct FrameInfo {
     bool referencePicture = false;
     bool truncatedStart = false;
     int poc = -1;
+    bool pocValid = false; // HEVC can have a valid negative POC (including -1).
+    QString pocDescription;
+    bool hasPoc() const { return pocValid || poc >= 0; }
     int unitSize = 16;
     int unitColumns = 0;
     int unitRows = 0;
@@ -164,6 +187,10 @@ struct FrameInfo {
     QVector<DecodedUnitInfo> decodedUnits;
     bool decodedUnitsReady = false;
     QString decodedUnitsError;
+    QVector<MotionVectorInfo> motionVectors;
+    QMap<int, QVector<int>> motionByMacroblock;
+    bool motionVectorsReady = false;
+    QString motionVectorsError;
     QVector<HevcCodingUnitInfo> hevcCodingUnits;
     bool hevcCodingUnitsReady = false;
     QString hevcCodingUnitsError;
@@ -189,6 +216,10 @@ struct ParameterSetInfo {
     int minCodingBlockSize = 8;
     int ctbSize = 64;
     int sliceAddressBits = 0;
+    bool separateColourPlane = false;
+    bool dependentSliceSegments = false;
+    bool outputFlagPresent = false;
+    int extraSliceHeaderBits = 0;
     int entropyCoding = 0;
     int initQp = 0;
     int defaultL0 = 1;
@@ -250,6 +281,28 @@ struct StreamInfo {
         if (codec == Codec::Hevc) return QStringLiteral("H.265 / HEVC");
         if (codec == Codec::Mpeg4Visual) return QStringLiteral("MPEG-4 Part 2 Visual");
         return QStringLiteral("AV1");
+    }
+
+    QString entropyCodingName() const {
+        if (codec == Codec::Hevc) return QStringLiteral("CABAC");
+        if (codec == Codec::Av1) return QStringLiteral("多符号算术编码");
+        if (codec == Codec::Mpeg4Visual) return QStringLiteral("VLC");
+        bool cabac = false, cavlc = false, unknown = false, used = false;
+        for (const auto &nal : nals) {
+            if (!nal.hasSlice) continue;
+            used = true;
+            cabac |= nal.slice.entropyCoding == 1;
+            cavlc |= nal.slice.entropyCoding == 0;
+            unknown |= nal.slice.entropyCoding < 0;
+        }
+        if (!used) for (const auto &p : pps) {
+            cabac |= p.entropyCoding == 1;
+            cavlc |= p.entropyCoding == 0;
+        }
+        QString name = cabac && cavlc ? QStringLiteral("CABAC / CAVLC（混合）")
+            : cabac ? QStringLiteral("CABAC") : cavlc ? QStringLiteral("CAVLC") : QStringLiteral("未获取");
+        if (unknown && (cabac || cavlc)) name += QStringLiteral("（部分未知）");
+        return name;
     }
 };
 

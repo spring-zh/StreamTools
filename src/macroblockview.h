@@ -7,6 +7,8 @@
 class QMouseEvent;
 class QResizeEvent;
 class QWheelEvent;
+class QLabel;
+class QHideEvent;
 
 namespace bitscope {
 
@@ -31,6 +33,7 @@ public:
 Q_SIGNALS:
     void unitHovered(const QString &description);
     void zoomChanged(double zoom);
+    void motionRequested(int frame);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -41,8 +44,13 @@ protected:
     void wheelEvent(QWheelEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void leaveEvent(QEvent *event) override;
+    void hideEvent(QHideEvent *event) override;
 
 private:
+    friend struct MainWindowStatusTest;
+    void hideBubble();
+    void showBubble();
+    QString blockDetails(int address);
     QRectF basePictureRect() const;
     QRectF pictureRect() const;
     QRectF sourceRect(int x, int y, int width, int height,
@@ -65,6 +73,11 @@ private:
     QPointF m_pan;
     QPointF m_lastPanPosition;
     bool m_panning = false;
+    QLabel *m_hoverBubble = nullptr;
+    QPointF m_hoverPosition;
+    QPointF m_pressPosition;
+    bool m_pressed = false;
+    bool m_dragged = false;
 };
 
 } // namespace bitscope

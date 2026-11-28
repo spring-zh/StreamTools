@@ -1,6 +1,7 @@
 #include "bitstreamparser.h"
 
 #include "bitreader.h"
+#include "hevcorder.h"
 
 #include <QFile>
 #include <QFileInfo>
@@ -1239,6 +1240,7 @@ SliceInfo parseAvcSlice(const NalUnit &nal, const QMap<int,ParameterSetInfo> &sp
     s.firstMb=int(br.ue());s.rawType=int(br.ue());s.type=sliceName(s.rawType);s.ppsId=int(br.ue());
     field(s.fields,"first_mb_in_slice",s.firstMb,"ue(v)");field(s.fields,"slice_type",QStringLiteral("%1 (%2)").arg(s.rawType).arg(s.type),"ue(v)");field(s.fields,"pic_parameter_set_id",s.ppsId,"ue(v)");
     const auto pps=ppsMap.value(s.ppsId);const auto sps=spsMap.value(pps.parentId);
+    if (pps.id >= 0) s.entropyCoding = pps.entropyCoding;
     if (sps.id >= 0) {
         s.frameNum=int(br.readBits(sps.log2FrameNum));field(s.fields,"frame_num",s.frameNum,QStringLiteral("u(%1)").arg(sps.log2FrameNum));
         if (!sps.frameOnly) { const bool fieldPic=br.flag();if(fieldPic)br.flag(); }
@@ -1262,26 +1264,62 @@ void skipProfileTierLevel(BitReader &br, int maxSubLayers, ParameterSetInfo &sps
 
 ParameterSetInfo parseHevcSps(const QByteArray &payload) {
     ParameterSetInfo sps;BitReader br(rbsp(payload,2));const int vps=int(br.readBits(4));const int maxSub=int(br.readBits(3));br.flag();field(sps.fields,"sps_video_parameter_set_id",vps,"u(4)");skipProfileTierLevel(br,maxSub,sps);
-    sps.id=int(br.ue());field(sps.fields,"sps_seq_parameter_set_id",sps.id,"ue(v)");sps.chroma=int(br.ue());field(sps.fields,"chroma_format_idc",sps.chroma,"ue(v)");if(sps.chroma==3)br.flag();
+    sps.id=int(br.ue());field(sps.fields,"sps_seq_parameter_set_id",sps.id,"ue(v)");sps.chroma=int(br.ue());field(sps.fields,"chroma_format_idc",sps.chroma,"ue(v)");if(sps.chroma==3){sps.separateColourPlane=br.flag();field(sps.fields,"separate_colour_plane_flag",sps.separateColourPlane,"u(1)");}
     int width=int(br.ue()),height=int(br.ue());field(sps.fields,"pic_width_in_luma_samples",width,"ue(v)");field(sps.fields,"pic_height_in_luma_samples",height,"ue(v)");
+    const int codedWidth=width,codedHeight=height;
     if(br.flag()){const int l=int(br.ue()),r=int(br.ue()),t=int(br.ue()),b=int(br.ue()),sw=(sps.chroma==1||sps.chroma==2)?2:1,sh=sps.chroma==1?2:1;width-=(l+r)*sw;height-=(t+b)*sh;}
     sps.width=width;sps.height=height;sps.bitDepth=int(br.ue())+8;br.ue();sps.log2Poc=int(br.ue())+4;
+    if(sps.log2Poc<4||sps.log2Poc>16)throw std::runtime_error("Invalid HEVC POC bit width");
+    field(sps.fields,"log2_max_pic_order_cnt_lsb_minus4",sps.log2Poc-4,"ue(v)");
     const bool ordering=br.flag();for(int i=ordering?0:maxSub;i<=maxSub;++i){sps.maxReferences=int(br.ue())+1;br.ue();br.ue();}
     const int log2Min=int(br.ue())+3,diff=int(br.ue()),log2Ctb=log2Min+diff;
+    if(log2Min<3||log2Ctb<4||log2Ctb>6)throw std::runtime_error("Invalid HEVC CTB size");
     sps.minCodingBlockSize=1<<log2Min;sps.ctbSize=1<<log2Ctb;br.ue();br.ue();br.ue();br.ue();
-    const int count=int(std::ceil(double(width)/sps.ctbSize)*std::ceil(double(height)/sps.ctbSize));sps.sliceAddressBits=int(std::ceil(std::log2(std::max(1,count))));
+    const int count=int(std::ceil(double(codedWidth)/sps.ctbSize)*std::ceil(double(codedHeight)/sps.ctbSize));sps.sliceAddressBits=int(std::ceil(std::log2(std::max(1,count))));
     field(sps.fields,"min_coding_block_size",sps.minCodingBlockSize,"pixels","SPS 允许的最小亮度 CU 边长");
     field(sps.fields,"ctb_size",sps.ctbSize,"pixels","最大编码树单元 CTU 边长");field(sps.fields,"ctb_count",count,"units");return sps;
 }
 
 ParameterSetInfo parseHevcPps(const QByteArray &payload) {
-    ParameterSetInfo pps;BitReader br(rbsp(payload,2));pps.id=int(br.ue());pps.parentId=int(br.ue());field(pps.fields,"pps_pic_parameter_set_id",pps.id,"ue(v)");field(pps.fields,"pps_seq_parameter_set_id",pps.parentId,"ue(v)");field(pps.fields,"dependent_slice_segments_enabled_flag",br.flag(),"u(1)");field(pps.fields,"output_flag_present_flag",br.flag(),"u(1)");field(pps.fields,"num_extra_slice_header_bits",br.readBits(3),"u(3)");return pps;
+    ParameterSetInfo pps;BitReader br(rbsp(payload,2));
+    pps.id=int(br.ue());pps.parentId=int(br.ue());
+    field(pps.fields,"pps_pic_parameter_set_id",pps.id,"ue(v)");
+    field(pps.fields,"pps_seq_parameter_set_id",pps.parentId,"ue(v)");
+    pps.dependentSliceSegments=br.flag();pps.outputFlagPresent=br.flag();pps.extraSliceHeaderBits=int(br.readBits(3));
+    field(pps.fields,"dependent_slice_segments_enabled_flag",pps.dependentSliceSegments,"u(1)");
+    field(pps.fields,"output_flag_present_flag",pps.outputFlagPresent,"u(1)");
+    field(pps.fields,"num_extra_slice_header_bits",pps.extraSliceHeaderBits,"u(3)");
+    return pps;
 }
 
 SliceInfo parseHevcSlice(const NalUnit &nal, const QMap<int,ParameterSetInfo> &spsMap, const QMap<int,ParameterSetInfo> &ppsMap) {
-    SliceInfo s;BitReader br(rbsp(nal.payload,2));s.firstSlice=br.flag();field(s.fields,"first_slice_segment_in_pic_flag",s.firstSlice,"u(1)");if(nal.nalType>=16&&nal.nalType<=23)br.flag();s.ppsId=int(br.ue());field(s.fields,"slice_pic_parameter_set_id",s.ppsId,"ue(v)");const auto pps=ppsMap.value(s.ppsId),sps=spsMap.value(pps.parentId);
-    if(!s.firstSlice&&sps.sliceAddressBits>0){s.address=int(br.readBits(sps.sliceAddressBits));field(s.fields,"slice_segment_address",s.address,QStringLiteral("u(%1)").arg(sps.sliceAddressBits));}
-    if(nal.nalType>=16&&nal.nalType<=21){s.type="I";s.rawType=2;}else{s.rawType=int(br.ue());s.type=sliceName(s.rawType);field(s.fields,"slice_type",QStringLiteral("%1 (%2)").arg(s.rawType).arg(s.type),"ue(v)");if(s.type=="P"||s.type=="B"){s.numRefL0=1;if(s.type=="B")s.numRefL1=1;}}
+    SliceInfo s;BitReader br(rbsp(nal.payload,2));
+    s.firstSlice=br.flag();field(s.fields,"first_slice_segment_in_pic_flag",s.firstSlice,"u(1)");
+    if(nal.nalType>=16&&nal.nalType<=23)field(s.fields,"no_output_of_prior_pics_flag",br.flag(),"u(1)");
+    s.ppsId=int(br.ue());field(s.fields,"slice_pic_parameter_set_id",s.ppsId,"ue(v)");
+    const auto pps=ppsMap.value(s.ppsId),sps=spsMap.value(pps.parentId);
+    const int layerId=((quint8(nal.payload.at(0))&1)<<5)|(quint8(nal.payload.at(1))>>3);
+    if(pps.id<0||sps.id<0||layerId!=0) {
+        field(s.fields,"parse_status",layerId?"Multilayer HEVC POC not supported":"Missing active PPS/SPS");
+        return s;
+    }
+    if(!s.firstSlice){
+        if(pps.dependentSliceSegments){s.dependentSlice=br.flag();field(s.fields,"dependent_slice_segment_flag",s.dependentSlice,"u(1)");}
+        s.address=int(br.readBits(sps.sliceAddressBits));
+        field(s.fields,"slice_segment_address",s.address,QStringLiteral("u(%1)").arg(sps.sliceAddressBits));
+    }
+    if(s.dependentSlice)return s;
+    for(int i=0;i<pps.extraSliceHeaderBits;++i)field(s.fields,QStringLiteral("slice_reserved_flag[%1]").arg(i),br.flag(),"u(1)");
+    s.rawType=int(br.ue());
+    if(s.rawType>2)throw std::runtime_error("Invalid HEVC slice_type");
+    s.type=QStringList{QStringLiteral("B"),QStringLiteral("P"),QStringLiteral("I")}.at(s.rawType);
+    field(s.fields,"slice_type",QStringLiteral("%1 (%2)").arg(s.rawType).arg(s.type),"ue(v)");
+    if(pps.outputFlagPresent)field(s.fields,"pic_output_flag",br.flag(),"u(1)");
+    if(sps.separateColourPlane)field(s.fields,"colour_plane_id",br.readBits(2),"u(2)");
+    s.pocBits=sps.log2Poc;
+    if(nal.nalType==19||nal.nalType==20)s.pocLsb=0;
+    else {s.pocLsb=int(br.readBits(s.pocBits));field(s.fields,"slice_pic_order_cnt_lsb",s.pocLsb,QStringLiteral("u(%1)").arg(s.pocBits));}
+    if(s.type=="P"||s.type=="B"){s.numRefL0=1;if(s.type=="B")s.numRefL1=1;}
     return s;
 }
 
@@ -1310,11 +1348,12 @@ bool isParameter(Codec codec,int type){
 }
 
 void analyzeFrames(StreamInfo &stream) {
+    if(stream.codec==Codec::Hevc)deriveHevcPocs(stream);
     QVector<int> dpb;QVector<int> av1Slots(8,-1);const int maxReferences=std::max(1,stream.sps.value(stream.primarySpsId).maxReferences);const int unitSize=(stream.codec==Codec::Hevc||stream.codec==Codec::Av1)?stream.sps.value(stream.primarySpsId).ctbSize:16;
     const int cols=stream.width>0?int(std::ceil(double(stream.width)/unitSize)):0,rows=stream.height>0?int(std::ceil(double(stream.height)/unitSize)):0,total=cols*rows;
     for(auto &frame:stream.frames){
-        QSet<QString> types;frame.randomAccess=false;frame.referencePicture=false;if(stream.codec!=Codec::Mpeg4Visual)frame.poc=-1;
-        for(int ni:frame.sliceNalIndices){const auto &nal=stream.nals.at(ni);types.insert(nal.slice.type);if(stream.codec==Codec::Avc){frame.randomAccess|=nal.nalType==5;frame.referencePicture|=nal.refIdc>0;}else if(stream.codec==Codec::Hevc){frame.randomAccess|=nal.nalType>=16&&nal.nalType<=21;frame.referencePicture|=(nal.nalType&1)!=0||nal.nalType>=16;}else if(stream.codec==Codec::Mpeg4Visual){frame.randomAccess|=nal.slice.type==QStringLiteral("I");frame.referencePicture|=nal.slice.type==QStringLiteral("I")||nal.slice.type==QStringLiteral("P")||nal.slice.type==QStringLiteral("S");}else{frame.randomAccess|=nal.slice.type==QStringLiteral("KEY")&&nal.slice.showFrame;frame.referencePicture|=nal.slice.refreshFrameFlags!=0;}if(frame.poc<0||stream.codec==Codec::Av1&&nal.slice.showFrame&&nal.slice.poc>=0)frame.poc=nal.slice.poc;}
+        QSet<QString> types;frame.randomAccess=false;frame.referencePicture=false;if(stream.codec!=Codec::Mpeg4Visual&&stream.codec!=Codec::Hevc)frame.poc=-1;
+        for(int ni:frame.sliceNalIndices){const auto &nal=stream.nals.at(ni);types.insert(nal.slice.type);if(stream.codec==Codec::Avc){frame.randomAccess|=nal.nalType==5;frame.referencePicture|=nal.refIdc>0;}else if(stream.codec==Codec::Hevc){frame.randomAccess|=nal.nalType>=16&&nal.nalType<=21;frame.referencePicture|=(nal.nalType&1)!=0||nal.nalType>=16;}else if(stream.codec==Codec::Mpeg4Visual){frame.randomAccess|=nal.slice.type==QStringLiteral("I");frame.referencePicture|=nal.slice.type==QStringLiteral("I")||nal.slice.type==QStringLiteral("P")||nal.slice.type==QStringLiteral("S");}else{frame.randomAccess|=nal.slice.type==QStringLiteral("KEY")&&nal.slice.showFrame;frame.referencePicture|=nal.slice.refreshFrameFlags!=0;}if(stream.codec!=Codec::Hevc&&(frame.poc<0||(stream.codec==Codec::Av1&&nal.slice.showFrame&&nal.slice.poc>=0)))frame.poc=nal.slice.poc;}
         if(stream.codec==Codec::Av1&&frame.type==QStringLiteral("SHOW_EXISTING"))frame.poc=-1;
         QStringList typeList(types.begin(),types.end());std::sort(typeList.begin(),typeList.end());frame.displayType=frame.randomAccess?(stream.codec==Codec::Avc?"IDR":(stream.codec==Codec::Hevc?"IRAP":(stream.codec==Codec::Av1?"KEY":"I"))):typeList.join('/');if(frame.displayType.isEmpty())frame.displayType=frame.type;
         frame.truncatedStart=(stream.codec==Codec::Mpeg4Visual||stream.codec==Codec::Av1)?false:(!frame.sliceNalIndices.isEmpty()&&(stream.codec==Codec::Avc?stream.nals.at(frame.sliceNalIndices.first()).slice.firstMb!=0:!stream.nals.at(frame.sliceNalIndices.first()).slice.firstSlice));
@@ -1327,7 +1366,7 @@ void analyzeFrames(StreamInfo &stream) {
         if(stream.codec==Codec::Av1){
             for(int ni:frame.sliceNalIndices){const auto &header=stream.nals.at(ni).slice;for(int slot:header.referenceSlots)if(slot>=0&&slot<av1Slots.size())appendReference(av1Slots.at(slot));for(int slot=0;slot<8;++slot)if((header.refreshFrameFlags&(1<<slot))!=0)av1Slots[slot]=frame.index;}
         }else if(types.contains("B")){
-            QVector<int> lower,higher;for(int ref:dpb){const int refPoc=stream.frames.at(ref).poc;if(frame.poc>=0&&refPoc>=0&&(refPoc>frame.poc))higher.push_back(ref);else lower.push_back(ref);}
+            QVector<int> lower,higher;for(int ref:dpb){const int refPoc=stream.frames.at(ref).poc;if(frame.hasPoc()&&stream.frames.at(ref).hasPoc()&&(refPoc>frame.poc))higher.push_back(ref);else lower.push_back(ref);}
             if(stream.codec==Codec::Mpeg4Visual){lower.clear();higher.clear();for(int ref:dpb){if(stream.frames.at(ref).pts>frame.pts+0.000001)higher.push_back(ref);else lower.push_back(ref);}if(higher.isEmpty()&&dpb.size()>=2){lower={dpb.at(dpb.size()-2)};higher={dpb.last()};}}
             std::sort(lower.begin(),lower.end(),[&stream](int a,int b){return stream.frames.at(a).poc>stream.frames.at(b).poc;});
             std::sort(higher.begin(),higher.end(),[&stream](int a,int b){return stream.frames.at(a).poc<stream.frames.at(b).poc;});

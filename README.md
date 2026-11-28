@@ -15,7 +15,7 @@
 ```
 
 打包电脑需要 Xcode Command Line Tools、CMake、Python 3.9+、Qt 6.5+（含 `macdeployqt`）、FFmpeg，
-以及带本项目补丁的 HEVC `HM_180` 和 AV1 `inspect`。目标电脑不需要这些开发环境。
+以及带本项目补丁的 HEVC `HM_180`、AV1 `inspect` 和 H.264 运动矢量提取器 `bitscope-avc-motion`。目标电脑不需要这些开发环境。
 脚本会优先读取显式参数/环境变量，其次从已有的 `build-qt`、`build` 和专用打包构建目录查找分析器；
 最后查询 PATH。全新源码克隆不包含分析器二进制，需要先按下方说明编译分析器。
 
@@ -26,15 +26,16 @@
   --qt-prefix /opt/homebrew/opt/qt \
   --ffmpeg /opt/homebrew/bin/ffmpeg \
   --hevc-analyzer /path/to/HM_180 \
-  --av1-inspect /path/to/inspect
+  --av1-inspect /path/to/inspect \
+  --avc-motion /path/to/bitscope-avc-motion
 ```
 
-也支持 `BITSCOPE_FFMPEG`、`BITSCOPE_HEVC_ANALYZER`、`BITSCOPE_AV1_INSPECT` 环境变量。
+也支持 `BITSCOPE_FFMPEG`、`BITSCOPE_HEVC_ANALYZER`、`BITSCOPE_AV1_INSPECT`、`BITSCOPE_AVC_MOTION` 环境变量。
 使用 `--help` 查看全部参数。
 
 每次生成一个新的 `dist/BitScope-macOS-架构-时间-随机后缀/`，不覆盖旧包：
 
-- `BitScope.app`：独立运行应用，包含 Qt、FFmpeg 及其动态库、两种详细块分析器。
+- `BitScope.app`：独立运行应用，包含 Qt、FFmpeg 及其动态库、详细块分析器和 H.264 运动矢量提取器。
 - `BitScope.zip`：可传输的应用压缩包，保留应用结构和符号链接。
 - `使用说明.txt`：适用架构、最低 macOS 版本、签名和使用说明。
 - `build-manifest.json`、`deployment.log`：依赖审计和部署日志，包含构建机路径，不必发给最终用户。
@@ -105,10 +106,36 @@ python3 scripts/build_macos_deps.py --arch arm64 --jobs 3
 ```
 
 Intel Mac 将 `arm64` 改为 `x86_64`。完成后根据输出的 `dependencies.json` 中路径，
-将 `hevc_analyzer`、`av1_inspect`、`ffmpeg` 分别传给打包脚本的
-`--hevc-analyzer`、`--av1-inspect`、`--ffmpeg`，并通过 `--dependency-notices` 传入该构建目录的 `licenses`。
+将 `hevc_analyzer`、`av1_inspect`、`ffmpeg`、`avc_motion` 分别传给打包脚本的
+`--hevc-analyzer`、`--av1-inspect`、`--ffmpeg`、`--avc-motion`，并通过 `--dependency-notices` 传入该构建目录的 `licenses`。
 
 ### macOS / Linux
+
+四种编码都支持悬停气泡，鼠标移开即隐藏；单击不锁定块，放大拖拽用于平移。
+H.264 / MPEG-4 显示宏块，H.265 显示真实 CU / 所属 CTU，AV1 显示 Coding Block / 所属 Superblock。
+尺寸、QP / QIndex、预测模式、变换和运动信息按各解码器实际导出能力显示；缺失数据不填零。
+顶部编码卡显示熵编码类型；H.264 根据各 Slice 的活动 PPS 区分 CABAC / CAVLC / 混合，
+MPEG-4 的 VLC 类别暂不细分 RVLC。原“学习 / 对比”标签已移除，当前帧统计保留。
+帧表的类型与结构合并显示为 `P（完整帧）`、`INTER（Frame OBU）` 等；POC / Order Hint 位于 PTS 后，偏移列位于大小列后。
+H.265 POC 从活动 SPS/PPS 和 Slice 头按解码顺序推导，处理 LSB 回绕、TemporalId、IDR/BLA/CRA、负 POC 和依赖分片；语法树保留原始 LSB 和推导值。
+中途截取且缺少随机访问上下文时，POC 提示为片段基准；缺失头信息、分片 POC 冲突或不支持的多层 HEVC 不伪造数值。
+运动矢量的位移表示当前块到参考采样位置，不是物体运动轨迹或编码器的搜索过程。
+H.264 显示 L0 / L1；MPEG-4 显示前向 / 后向参考；H.265 按 PU 显示 L0 / L1、参考 POC 和 1/4 像素位移；
+AV1 按 MV0 / MV1 显示参考槽名称与 1/8 像素换算（全局 / 仿射运动另有提示）。
+H.265 直接复用已有 CU 分析的 `decoder_mv.txt`，不增加一次解码；其中 POC 属于分析片段，不等同于界面帧编号。
+MV 按需异步提取，帧间重排使用帧标识绑定，最近四帧结果缓存；不随缩略图批量生成。
+H.264 / MPEG-4 当前导出接口不提供精确参考索引 / MVP / MVD，8×8 内更小子分区未细分；场编码和非零左上裁剪暂不提供 MV，以免坐标误导。
+
+本地构建运动提取器（需要 C/C++ 编译器、make、curl、patch、pkg-config；工作目录必须尚不存在）：
+
+```bash
+bash scripts/build-motion-helper.sh "$PWD/build-motion-local" 4
+cmake -S . -B build -DBITSCOPE_AVC_MOTION_EXECUTABLE="$PWD/build-motion-local/bitscope-avc-motion"
+```
+
+脚本使用校验过的 FFmpeg 8.0.1 源码，补齐 MPEG-4 B-VOP 的真实运动表导出，静态链接最小解码库。
+直接用系统 FFmpeg 开发库编译的旧提取器不能保证 MPEG-4 B 帧矢量正确，新版未打补丁的构建会明确拒绝这类帧，避免把未填充数据显示成零运动。
+完整 CI 依赖脚本会自动构建带补丁的提取器。
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -183,6 +210,8 @@ H.265 CU 和 AV1 Coding Block 提取、界面截图。测试文件在构建时�
 
 安装 Visual Studio 2022（C++ 桌面开发和 Windows SDK）、Qt 的 `msvc2022_64` 组件、
 CMake 3.21+、Git、PowerShell 7 和 NASM。确保 `cmake`、`git`、`nasm` 在 PATH 中。
+运动提取器还需要 MSYS2 UCRT64，安装 `make patch tar curl nasm mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkgconf`。
+默认使用 `C:\msys64`，其他位置通过 `BITSCOPE_MSYS2_ROOT` 指定；主程序仍使用 MSVC，二者通过独立进程通信。
 在 **PowerShell 7** 中执行（替换 Qt 路径）：
 
 ```powershell
@@ -192,7 +221,7 @@ pwsh -NoProfile -File .\package-windows.ps1 -QtPrefix C:\Qt\6.8.3\msvc2022_64
 脚本默认自动下载/构建缺失的视频分析工具：
 
 - `scripts/build-windows-deps.ps1`：获取固定提交的 Gitl/HM、libaom，应用项目补丁并编译，
-  下载校验过的 FFmpeg 8.0.1 essentials Windows x64 静态版本。
+  下载校验过的 FFmpeg 8.0.1 essentials Windows x64 版本，并独立编译带补丁的 H.264 / MPEG-4 运动矢量提取器。
 - `scripts/hevc-helper/CMakeLists.txt`：只构建 HEVC 参考解码/分析器，不构建上游 Qt GUI。
 - `package-windows.ps1`：编译主程序，通过 `windeployqt` 部署 Qt，复制辅助工具和声明，
   下载并验证微软签名的 VC++ 运行库安装器，测试后输出文件夹和 ZIP。
@@ -211,6 +240,7 @@ pwsh -File .\package-windows.ps1 `
   -FFmpeg C:\tools\ffmpeg\bin\ffmpeg.exe `
   -HevcAnalyzer C:\tools\HM_180.exe `
   -Av1Inspect C:\tools\av1inspect.exe `
+  -AvcMotion C:\tools\bitscope-avc-motion.exe `
   -VcRedist C:\tools\VC_redist.x64.exe
 ```
 

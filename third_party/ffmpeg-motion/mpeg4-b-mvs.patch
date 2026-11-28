@@ -1,0 +1,29 @@
+diff --git a/libavcodec/h263dec.c b/libavcodec/h263dec.c
+--- a/libavcodec/h263dec.c
++++ b/libavcodec/h263dec.c
+@@ -276,6 +276,25 @@
+ 
+             if (h->c.pict_type != AV_PICTURE_TYPE_B)
+                 ff_h263_update_motion_val(&h->c);
++            else if (h->c.avctx->codec_id == AV_CODEC_ID_MPEG4 &&
++                     (h->c.avctx->export_side_data & AV_CODEC_EXPORT_DATA_MVS) &&
++                     !h->c.mb_intra &&
++                     (h->c.mv_type == MV_TYPE_16X16 || h->c.mv_type == MV_TYPE_8X8)) {
++                /* B pictures are not references, so their motion tables normally
++                 * remain zero. Preserve the decoded/derived vectors for export;
++                 * do not change predictor tables or motion compensation. Field
++                 * pictures are deliberately not exposed by the BitScope helper. */
++                for (int list = 0; list < 2; list++) {
++                    if (!(h->c.mv_dir & (1 << list)) || !h->c.cur_pic.motion_val[list])
++                        continue;
++                    for (int block = 0; block < 4; block++) {
++                        const int part = h->c.mv_type == MV_TYPE_8X8 ? block : 0;
++                        const int xy = h->c.block_index[block];
++                        h->c.cur_pic.motion_val[list][xy][0] = h->c.mv[list][part][0];
++                        h->c.cur_pic.motion_val[list][xy][1] = h->c.mv[list][part][1];
++                    }
++                }
++            }
+ 
+             if (ret < 0) {
+                 const int xy = h->c.mb_x + h->c.mb_y * h->c.mb_stride;

@@ -28,6 +28,7 @@ class HevcCuProvider;
 class MacroblockView;
 class PreviewProvider;
 class TimelineWidget;
+class AvcMotionProvider;
 
 class MainWindow final : public QMainWindow {
     Q_OBJECT
@@ -78,6 +79,8 @@ private:
     PreviewProvider *m_previews = nullptr;
     HevcCuProvider *m_hevcCuProvider = nullptr;
     Av1BlockProvider *m_av1BlockProvider = nullptr;
+    AvcMotionProvider *m_motionProvider = nullptr;
+    QList<int> m_motionCache;
     QFutureWatcher<StreamPtr> m_watcher;
 
     QLabel *m_fileLabel = nullptr;

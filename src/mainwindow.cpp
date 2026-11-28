@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 
 #include "av1blockprovider.h"
+#include "avcmotionprovider.h"
 #include "bitstreamparser.h"
 #include "frametablemodel.h"
 #include "hevccuprovider.h"
@@ -163,6 +164,36 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     m_previews = new PreviewProvider(this);
     m_hevcCuProvider = new HevcCuProvider(this);
     m_av1BlockProvider = new Av1BlockProvider(this);
+    m_motionProvider = new AvcMotionProvider(this);
+    connect(m_macroView, &MacroblockView::motionRequested, m_motionProvider, &AvcMotionProvider::requestFrame);
+    connect(m_motionProvider, &AvcMotionProvider::ready, this, [this](int index, const QVector<MotionVectorInfo> &vectors) {
+        if (!m_stream || index < 0 || index >= m_stream->frames.size()) return;
+        auto &frame = m_stream->frames[index];
+        frame.motionVectors = vectors;
+        frame.motionVectorsReady = true;
+        frame.motionVectorsError.clear();
+        frame.motionByMacroblock.clear();
+        for (int i = 0; i < vectors.size(); ++i) {
+            const auto &v = vectors.at(i);
+            const int col = v.centerX / 16, row = v.centerY / 16;
+            if (col < frame.unitColumns && row < frame.unitRows)
+                frame.motionByMacroblock[row * frame.unitColumns + col].append(i);
+        }
+        m_motionCache.removeAll(index);
+        m_motionCache.append(index);
+        while (m_motionCache.size() > 4) {
+            auto &old = m_stream->frames[m_motionCache.takeFirst()];
+            old.motionVectors = {};
+            old.motionByMacroblock.clear();
+            old.motionVectorsReady = false;
+        }
+        if (index == m_currentFrame) m_macroView->refreshFrameData();
+    });
+    connect(m_motionProvider, &AvcMotionProvider::unavailable, this, [this](int index, const QString &reason) {
+        if (!m_stream || index < 0 || index >= m_stream->frames.size()) return;
+        m_stream->frames[index].motionVectorsError = reason;
+        if (index == m_currentFrame) m_macroView->refreshFrameData();
+    });
 
     connect(&m_watcher, &QFutureWatcher<StreamPtr>::finished, this, &MainWindow::parseFinished);
     connect(m_previews, &PreviewProvider::thumbnailReady, this, [this](int frame, const QImage &image) {
@@ -275,6 +306,17 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 }
 
 MainWindow::~MainWindow() {
+    disconnect(m_motionProvider, nullptr, this, nullptr);
+    m_motionProvider->setStream({});
+    // Stop workers before Qt destroys the preview widgets. Waiting for a
+    // QProcess in a provider destructor may synchronously emit final results.
+    // Those results must not call UI slots after the central widget is gone.
+    disconnect(m_previews, nullptr, this, nullptr);
+    disconnect(m_hevcCuProvider, nullptr, this, nullptr);
+    disconnect(m_av1BlockProvider, nullptr, this, nullptr);
+    m_previews->setStream({});
+    m_hevcCuProvider->setStream({});
+    m_av1BlockProvider->setStream({});
     if (m_watcher.isRunning()) m_watcher.waitForFinished();
 }
 
@@ -462,10 +504,11 @@ void MainWindow::buildUi() {
     m_table->horizontalHeader()->setStretchLastSection(true);
     m_table->setColumnWidth(0, 56);
     m_table->setColumnWidth(1, 112);
-    m_table->setColumnWidth(2, 82);
+    m_table->setColumnWidth(2, 190);
     m_table->setColumnWidth(3, 112);
     m_table->setColumnWidth(4, 112);
-    m_table->setColumnWidth(5, 110);
+    m_table->setColumnWidth(5, 90);
+    m_table->setColumnWidth(6, 110);
     m_leftStack->addWidget(m_table);
     m_fileTree = new QTreeWidget(m_leftStack);
     m_fileTree->setHeaderLabels({QStringLiteral("MP4 Box"), QStringLiteral("偏移"), QStringLiteral("大小"), QStringLiteral("说明")});
@@ -517,7 +560,7 @@ void MainWindow::buildUi() {
     pictureLayout->addLayout(overlayTools);
     m_macroView = new MacroblockView(picturePage);
     pictureLayout->addWidget(m_macroView, 1);
-    const QString previewHint = QStringLiteral("滚轮缩放 · 放大后拖动画面 · 移动鼠标查看宏块 / CTU / Superblock 的真实尺寸、地址和所属帧单元");
+    const QString previewHint = QStringLiteral("滚轮缩放 · 放大后拖拽平移 · 悬停查看宏块 / CU / Coding Block 详情");
     m_unitInfo = new QLabel(previewHint, picturePage);
     m_unitInfo->setObjectName(QStringLiteral("hint"));
     m_unitInfo->setWordWrap(true);
@@ -533,7 +576,7 @@ void MainWindow::buildUi() {
     });
     connect(m_macroView, &MacroblockView::unitHovered, this, [this](const QString &text) {
         m_unitInfo->setText(text.isEmpty()
-            ? QStringLiteral("滚轮缩放 · 放大后拖动画面 · 移动鼠标查看宏块 / CTU / Superblock 的真实尺寸、地址和所属帧单元")
+            ? QStringLiteral("滚轮缩放 · 放大后拖拽平移 · 悬停查看宏块 / CU / Coding Block 详情")
             : text);
     });
     m_tabs->addTab(picturePage, QStringLiteral("画面 / 宏块"));
@@ -763,6 +806,8 @@ void MainWindow::openFile(const QString &path) {
     m_hevcCuProvider->setStream({});
     m_av1BlockProvider->setStream({});
     m_timeline->setStream({});
+    m_motionProvider->setStream({});
+    m_motionCache.clear();
     m_macroView->setStream({});
     m_currentFrame = -1;
     clearDetails(QStringLiteral("正在分析码流…"));
@@ -782,6 +827,7 @@ void MainWindow::parseFinished() {
     m_previews->setStream(m_stream);
     m_hevcCuProvider->setStream(m_stream);
     m_av1BlockProvider->setStream(m_stream);
+    m_motionProvider->setStream(m_stream);
     m_timeline->setStream(m_stream);
     m_macroView->setStream(m_stream);
     const bool mpeg4 = m_stream->codec == Codec::Mpeg4Visual;
@@ -797,6 +843,9 @@ void MainWindow::parseFinished() {
     m_tabs->setTabText(0, av1 ? QStringLiteral("画面 / Superblock") : QStringLiteral("画面 / 宏块"));
     m_mode->setItemText(1, mpeg4 ? QStringLiteral("起始码单元视图") : (av1 ? QStringLiteral("OBU 视图") : QStringLiteral("NAL 视图")));
     m_tabs->setTabText(m_tabs->indexOf(m_slices), mpeg4 ? QStringLiteral("VOP") : (av1 ? QStringLiteral("Frame Header") : QStringLiteral("Slice")));
+    const bool avc = m_stream->codec == Codec::Avc;
+    if (avc && m_tabs->currentWidget() == m_cuTree) m_tabs->setCurrentIndex(0);
+    m_tabs->setTabVisible(m_tabs->indexOf(m_cuTree), !avc);
     m_tabs->setTabText(m_tabs->indexOf(m_cuTree), av1 ? QStringLiteral("Superblock / Block") : QStringLiteral("CTU / CU"));
     m_cuTree->setHeaderLabels(av1
         ? QStringList{QStringLiteral("Superblock / Coding Block"), QStringLiteral("位置"),
@@ -864,7 +913,16 @@ void MainWindow::setViewMode(int index) {
             m_typeFilter->addItem(QStringLiteral("B 帧"), QStringLiteral("B"));
         }
         m_table->setColumnWidth(1, 112);
+        m_table->setColumnWidth(2, 190);
+        m_table->setColumnWidth(3, 112);
+        m_table->setColumnWidth(4, 112);
+        m_table->setColumnWidth(5, 90);
+        m_table->setColumnWidth(6, 110);
     } else {
+        m_table->setColumnWidth(2, 82);
+        m_table->setColumnWidth(3, 112);
+        m_table->setColumnWidth(4, 112);
+        m_table->setColumnWidth(5, 110);
         m_typeFilter->addItem(m_stream && m_stream->codec == Codec::Mpeg4Visual
             ? QStringLiteral("VOP") : (m_stream && m_stream->codec == Codec::Av1
                 ? QStringLiteral("Frame OBU / Header") : QStringLiteral("Slice")), QStringLiteral("@slice"));
@@ -930,6 +988,7 @@ void MainWindow::showFileBox(QTreeWidgetItem *item)
     findBox(m_stream->boxes);
     if (!selected)
         return;
+    m_motionProvider->cancel();
     m_currentFrame = -1;
     refreshStatus();
     m_syntax->clear();
@@ -998,6 +1057,7 @@ void MainWindow::selectFrame(int frameIndex) {
 void MainWindow::showFrame(int frameIndex) {
     if (!m_stream || frameIndex < 0 || frameIndex >= m_stream->frames.size()) return;
     const FrameInfo &frame = m_stream->frames.at(frameIndex);
+    if (frameIndex != m_currentFrame) m_motionProvider->cancel();
     m_currentFrame = frameIndex;
     refreshStatus();
     m_macroView->setFrame(frameIndex);
@@ -1044,7 +1104,7 @@ void MainWindow::showFrame(int frameIndex) {
     new QTreeWidgetItem(frameRoot, {QStringLiteral("offset"), QStringLiteral("0x%1").arg(frame.offset, 8, 16, QChar('0')).toUpper(), QStringLiteral("bytes"), QStringLiteral("访问单元起始偏移")});
     new QTreeWidgetItem(frameRoot, {QStringLiteral("size"), QString::number(frame.size), QStringLiteral("bytes"), formatBytes(frame.size)});
     new QTreeWidgetItem(frameRoot, {QStringLiteral("pts"), timeText(frame.pts), QStringLiteral("derived"), QStringLiteral("由容器时间表或码流帧率推算")});
-    new QTreeWidgetItem(frameRoot, {m_stream->codec == Codec::Av1 ? QStringLiteral("order_hint") : QStringLiteral("poc"), frame.poc >= 0 ? QString::number(frame.poc) : QStringLiteral("—"), m_stream->codec == Codec::Av1 ? QStringLiteral("frame header") : QStringLiteral("slice"), m_stream->codec == Codec::Av1 ? QStringLiteral("AV1 Order Hint") : QStringLiteral("Picture Order Count")});
+    new QTreeWidgetItem(frameRoot, {m_stream->codec == Codec::Av1 ? QStringLiteral("order_hint") : QStringLiteral("poc"), frame.hasPoc() ? QString::number(frame.poc) : QStringLiteral("—"), m_stream->codec == Codec::Av1 ? QStringLiteral("frame header") : QStringLiteral("slice"), m_stream->codec == Codec::Av1 ? QStringLiteral("AV1 Order Hint") : (frame.pocDescription.isEmpty() ? QStringLiteral("Picture Order Count") : frame.pocDescription)});
     for (int nalIndex : frame.nalIndices) {
         const NalUnit &nal = m_stream->nals.at(nalIndex);
         const QString unitTitle = m_stream->codec == Codec::Mpeg4Visual
@@ -1138,6 +1198,7 @@ void MainWindow::showNal(int nalIndex) {
     int owner = -1;
     for (const FrameInfo &frame : m_stream->frames) if (frame.nalIndices.contains(nalIndex)) { owner = frame.index; break; }
     if (owner >= 0) {
+        if (owner != m_currentFrame) m_motionProvider->cancel();
         m_currentFrame = owner;
         refreshStatus();
         m_macroView->setFrame(owner);
@@ -1146,6 +1207,10 @@ void MainWindow::showNal(int nalIndex) {
         if (cached.isNull()) m_previews->requestFrame(owner);
         m_timeline->setSelectedFrame(owner);
         updateFrameStatistics(owner);
+    } else {
+        m_currentFrame = -1;
+        refreshStatus();
+        m_cuTree->clear();
     }
     m_slices->clear();
     if (nal.hasSlice) {
@@ -1370,7 +1435,7 @@ void MainWindow::updateFrameStatistics(int frameIndex)
                                "<span style='color:#8191a5'>refresh_frame_flags=0x%8%9　·　%10</span>")
                     .arg(frame.index).arg(totalUnits).arg(frame.unitColumns).arg(frame.unitRows)
                     .arg(frame.unitSize).arg(frame.sliceNalIndices.size())
-                    .arg(frame.poc >= 0 ? QString::number(frame.poc) : QStringLiteral("—"))
+                    .arg(frame.hasPoc() ? QString::number(frame.poc) : QStringLiteral("—"))
                     .arg(refreshFlags, 2, 16, QChar('0'))
                     .arg(showExisting ? QStringLiteral("　·　show_existing_frame") : QString())
                     .arg(state));
@@ -1532,6 +1597,10 @@ void MainWindow::updateCuTree(int frameIndex)
         return;
     }
     const FrameInfo &frame = m_stream->frames.at(frameIndex);
+    if (m_stream->codec == Codec::Avc) {
+        m_cuTree->setUpdatesEnabled(true);
+        return;
+    }
     if (m_stream->codec == Codec::Av1) {
         if (!frame.av1CodingBlocksReady) {
             new QTreeWidgetItem(m_cuTree, {frame.av1CodingBlocksError.isEmpty()
@@ -1729,7 +1798,13 @@ void MainWindow::updateMetrics() {
     const QString profileText = (m_stream->codec == Codec::Mpeg4Visual || m_stream->codec == Codec::Av1)
         ? m_stream->profileName.toHtmlEscaped()
         : QStringLiteral("Profile %1 / L%2").arg(m_stream->profile).arg(m_stream->level);
-    m_codecMetric->setText(QStringLiteral("<span style='color:#6f8298'>编码</span><br><b>%1</b> · %2").arg(m_stream->codecName(), profileText));
+    m_codecMetric->setText(QStringLiteral("<span style='color:#6f8298'>编码 · 熵编码 %3</span><br><b>%1</b> · %2")
+        .arg(m_stream->codecName(), profileText, m_stream->entropyCodingName()));
+    m_codecMetric->setToolTip(m_stream->codec == Codec::Avc
+        ? QStringLiteral("熵编码来自各 Slice 当时使用的 PPS entropy_coding_mode_flag；0=CAVLC，1=CABAC。")
+        : m_stream->codec == Codec::Mpeg4Visual
+            ? QStringLiteral("VLC 为编码类别；当前未进一步检测 RVLC 配置。")
+            : QStringLiteral("熵编码类别由编码标准确定；不是指所有头部字段都使用此编码。"));
     m_resolutionMetric->setText(QStringLiteral("<span style='color:#6f8298'>分辨率</span><br><b>%1 × %2</b> · %3-bit %4").arg(m_stream->width).arg(m_stream->height).arg(m_stream->bitDepth).arg(chroma));
     m_frameMetric->setText(QStringLiteral("<span style='color:#6f8298'>帧 / 码流单元</span><br><b>%1</b> 帧 · %2 %3")
         .arg(m_stream->frames.size()).arg(m_stream->nals.size())

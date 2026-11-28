@@ -27,6 +27,9 @@ qt_add_executable(BitScopeQt
     src/bitstreamparser.cpp
     src/hevcaccess.h
     src/mpeg4access.h
+    src/avclearning.h
+    src/avcmotionprovider.h
+    src/avcmotionprovider.cpp
     src/frametablemodel.h
     src/frametablemodel.cpp
     src/previewprovider.h
@@ -55,6 +58,35 @@ endif()
 
 set(BITSCOPE_HEVC_ANALYZER "" CACHE FILEPATH
     "Optional HM_180 analyzer executable to bundle for HEVC CU-tree extraction")
+set(BITSCOPE_AVC_MOTION_EXECUTABLE "" CACHE FILEPATH "H264 / MPEG4 motion-vector extraction helper")
+if(BITSCOPE_AVC_MOTION_EXECUTABLE AND EXISTS "${BITSCOPE_AVC_MOTION_EXECUTABLE}")
+    if(APPLE)
+        set(_motion_destination "$<TARGET_BUNDLE_CONTENT_DIR:BitScopeQt>/Resources/tools")
+        set(_motion_notices "$<TARGET_BUNDLE_CONTENT_DIR:BitScopeQt>/Resources/licenses/ffmpeg-motion")
+    else()
+        set(_motion_destination "$<TARGET_FILE_DIR:BitScopeQt>/tools")
+        set(_motion_notices "$<TARGET_FILE_DIR:BitScopeQt>/licenses/ffmpeg-motion")
+    endif()
+    add_custom_command(TARGET BitScopeQt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_motion_destination}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${BITSCOPE_AVC_MOTION_EXECUTABLE}" "${_motion_destination}/"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffmpeg-motion" "${_motion_notices}"
+        VERBATIM)
+    get_filename_component(_motion_source_dir "${BITSCOPE_AVC_MOTION_EXECUTABLE}" DIRECTORY)
+    if(EXISTS "${_motion_source_dir}/licenses")
+        add_custom_command(TARGET BitScopeQt POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory "${_motion_source_dir}/licenses" "${_motion_notices}"
+            VERBATIM)
+    endif()
+    if(WIN32)
+        file(GLOB _motion_dlls "${_motion_source_dir}/*.dll")
+        if(_motion_dlls)
+            add_custom_command(TARGET BitScopeQt POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_motion_dlls} "${_motion_destination}/"
+                VERBATIM)
+        endif()
+    endif()
+endif()
 if(BITSCOPE_HEVC_ANALYZER AND EXISTS "${BITSCOPE_HEVC_ANALYZER}")
     if(WIN32)
         set(_bitscope_hevc_helper_name "HM_180.exe")
@@ -139,6 +171,12 @@ install(SCRIPT ${deploy_script})
 option(BITSCOPE_BUILD_TESTS "Build BitScope smoke-test helpers" OFF)
 if(BITSCOPE_BUILD_TESTS)
     enable_testing()
+    qt_add_executable(BitScopeHevcOrderTest tests/hevcorder_test.cpp
+        src/bitstreamparser.cpp src/frametablemodel.cpp)
+    target_include_directories(BitScopeHevcOrderTest PRIVATE src)
+    target_link_libraries(BitScopeHevcOrderTest PRIVATE Qt6::Widgets)
+    target_compile_definitions(BitScopeHevcOrderTest PRIVATE QT_NO_KEYWORDS)
+    add_test(NAME hevc-picture-order COMMAND BitScopeHevcOrderTest)
     # Exercise the actual window's signal wiring as well as decoder failures.
     get_target_property(_bitscope_ui_sources BitScopeQt SOURCES)
     list(FILTER _bitscope_ui_sources EXCLUDE REGEX "(^|/)main\\.cpp$")

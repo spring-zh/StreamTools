@@ -6,6 +6,8 @@ param([string]$WorkRoot = (Join-Path $PSScriptRoot '../build-windows-deps'),
 if (-not $IsWindows) { throw 'Run this script on Windows (or a Windows GitHub Actions runner).' }
 $root = (Resolve-Path "$PSScriptRoot/..").Path
 foreach ($tool in @('git', 'cmake')) { Get-Command $tool -ErrorAction Stop | Out-Null }
+$msysRoot = if ($env:BITSCOPE_MSYS2_ROOT) { $env:BITSCOPE_MSYS2_ROOT } else { 'C:\msys64' }
+$motionBash = Require-File "$msysRoot/usr/bin/bash.exe"
 if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
     $nasmDirectory = Join-Path $env:ProgramFiles 'NASM'
     if (Test-Path "$nasmDirectory/nasm.exe") { $env:PATH = "$nasmDirectory;$env:PATH" }
@@ -74,14 +76,25 @@ Expand-Archive -LiteralPath $archive -DestinationPath "$work/ffmpeg"
 $ffmpegCandidates = @(Get-ChildItem "$work/ffmpeg" -Filter ffmpeg.exe -Recurse -File)
 if ($ffmpegCandidates.Count -ne 1) { throw 'Could not uniquely locate ffmpeg.exe.' }
 $ffmpegExe = $ffmpegCandidates[0].FullName
-foreach ($binary in @($hevcExe, $av1Exe, $ffmpegExe)) { Assert-X64PE $binary }
+$motionBuild = Join-Path $work 'motion-patched'
+$previousMsystem = $env:MSYSTEM
+try {
+    $env:MSYSTEM = 'UCRT64'
+    Invoke-Native $motionBash @('-lc', 'exec bash "$(cygpath -u "$1")" "$(cygpath -u "$2")" "$3"',
+        '--', "$PSScriptRoot/build-motion-helper.sh", $motionBuild, "$Jobs")
+} finally { $env:MSYSTEM = $previousMsystem }
+$motionExe = Require-File "$motionBuild/bitscope-avc-motion.exe"
+foreach ($binary in @($hevcExe, $av1Exe, $ffmpegExe, $motionExe)) { Assert-X64PE $binary }
 $manifest = Join-Path $work 'dependencies.json'
 @{ gitl_commit = $gitlCommit; hm_commit = $hmCommit; aom_commit = $aomCommit;
    ffmpeg_url = $ffmpegUrl; ffmpeg_sha256 = $ffmpegHash;
    hevc_patch_sha256 = (Get-FileHash "$root/third_party/hevc-cu-analyzer/bitscope-output-frames.patch").Hash;
    av1_patch_sha256 = (Get-FileHash "$root/third_party/aom-inspection/inspect-output-start.patch").Hash
    nasm_compat_patch_sha256 = (Get-FileHash "$root/third_party/aom-inspection/nasm-help-compat.patch").Hash
+   motion_patch_sha256 = (Get-FileHash "$root/third_party/ffmpeg-motion/mpeg4-b-mvs.patch").Hash
 } | ConvertTo-Json | Set-Content -Encoding utf8 $manifest
 # Native build output goes to the host, leaving exactly one object in the pipeline.
 [pscustomobject]@{ FFmpeg = $ffmpegExe; HevcAnalyzer = $hevcExe; Av1Inspect = $av1Exe;
+    AvcMotion = $motionExe;
+    MotionNotices = "$motionBuild/licenses";
     FFmpegRoot = $ffmpegCandidates[0].Directory.Parent.FullName; Manifest = $manifest }

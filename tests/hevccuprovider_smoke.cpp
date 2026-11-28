@@ -50,15 +50,22 @@ int main(int argc, char **argv)
         qint64 coveredPixels = 0;
         bool hasQp = false;
         bool hasSplit = false;
+        int motionCount = 0, motionMissing = 0;
         for (const auto &unit : units) {
             coveredPixels += qint64(unit.width) * unit.height;
             hasQp |= unit.qp >= 0;
             hasSplit |= unit.depth > 0;
+            motionCount += unit.motionVectors.size();
+            motionMissing += !unit.motionVectorsReady;
         }
         qInfo() << "HEVC frame" << frameIndex << "POC"
                 << stream->frames.at(frameIndex).poc << "coding units" << units.size()
                 << "QP" << hasQp << "split" << hasSplit << "coverage"
                 << coveredPixels << "/" << qint64(stream->width) * stream->height;
+        qInfo() << "Motion vectors" << motionCount << "CUs missing motion records" << motionMissing;
+        if (qEnvironmentVariableIsSet("BITSCOPE_REQUIRE_MOTION") && (motionCount == 0 || motionMissing != 0)) {
+            exitCode = 8; application.quit(); return;
+        }
         if (units.isEmpty() || !hasQp
             || coveredPixels != qint64(stream->width) * stream->height) {
             exitCode = 5;

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import shlex
 import sys
 import tempfile
 
@@ -32,6 +33,8 @@ def build_ffmpeg(work, aom_prefix, jobs, archive=None):
     source = work / "ffmpeg-source"
     source.mkdir()
     run(["tar", "-xf", archive, "--strip-components=1", "-C", source])
+    motion_patch = ROOT / "third_party/ffmpeg-motion/mpeg4-b-mvs.patch"
+    apply_patch(source, motion_patch)
     build = work / "ffmpeg-build"
     build.mkdir()
     temporary = build / "tmp"
@@ -40,7 +43,8 @@ def build_ffmpeg(work, aom_prefix, jobs, archive=None):
                TMPDIR=str(temporary))
     # Only the functionality used by BitScope: all four decoders, MP4/raw input
     # and scaled JPEG output. No Homebrew runtime or optional system codec libs.
-    options = ["--disable-autodetect", "--disable-shared", "--enable-static", "--disable-network",
+    prefix = work / "ffmpeg-prefix"
+    options = [f"--prefix={prefix}", "--disable-autodetect", "--disable-shared", "--enable-static", "--disable-network",
                "--disable-doc", "--disable-debug", "--disable-ffplay", "--disable-ffprobe",
                "--disable-everything", "--enable-libaom", "--pkg-config-flags=--static",
                "--enable-decoder=h264,hevc,mpeg4,libaom_av1",
@@ -51,13 +55,21 @@ def build_ffmpeg(work, aom_prefix, jobs, archive=None):
                "--enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,av1_frame_merge,av1_frame_split"]
     run([source / "configure", *options], env=env, cwd=build)
     run(["make", "-j", jobs, "ffmpeg"], env=env, cwd=build)
+    run(["make", "install"], env=env, cwd=build)
+    motion_env = dict(env, PKG_CONFIG_LIBDIR=f"{prefix}/lib/pkgconfig:{aom_prefix}/lib/pkgconfig")
+    flags = shlex.split(run(["pkg-config", "--static", "--cflags", "--libs", "libavcodec", "libavutil"],
+                            capture=True, env=motion_env))
+    run(["clang++", "-std=c++17", "-O2", "-DBITSCOPE_PATCHED_MPEG4_MVS=1", ROOT / "scripts/avc-motion-helper/main.cpp",
+         "-o", work / "bitscope-avc-motion", *flags], env=motion_env)
     notices = work / "licenses/ffmpeg"
     notices.mkdir(parents=True)
     for name in ("COPYING.LGPLv2.1", "COPYING.LGPLv3", "LICENSE.md"):
         shutil.copy2(source / name, notices / name)
     (notices / "SOURCE.txt").write_text(
-        f"Source: {FFMPEG_URL}\nSHA256: {FFMPEG_SHA256}\nNo source patches.\n"
+        f"Source: {FFMPEG_URL}\nSHA256: {FFMPEG_SHA256}\nPatch: mpeg4-b-mvs.patch\n"
         + "Configure options:\n" + "\n".join(options) + "\n", encoding="utf-8")
+    shutil.copy2(motion_patch, notices)
+    shutil.copy2(ROOT / "scripts/avc-motion-helper/main.cpp", notices / "bitscope-motion-main.cpp")
     return build / "ffmpeg"
 
 
@@ -137,7 +149,8 @@ def main():
     av1 = candidates[0]
     print("[3/3] Build checksum-pinned FFmpeg", flush=True)
     ffmpeg = build_ffmpeg(work, aom_prefix, args.jobs)
-    for binary in (hevc, av1, ffmpeg):
+    motion = work / "bitscope-avc-motion"
+    for binary in (hevc, av1, ffmpeg, motion):
         if args.arch not in run(["lipo", "-archs", binary], capture=True).split():
             raise RuntimeError(f"Wrong helper architecture: {binary}")
     manifest = work / "dependencies.json"
@@ -145,10 +158,13 @@ def main():
         "architecture": args.arch, "gitl_commit": GITL_COMMIT, "hm_commit": HM_COMMIT,
         "aom_commit": AOM_COMMIT, "hevc_analyzer": str(hevc), "av1_inspect": str(av1),
         "ffmpeg": str(ffmpeg), "ffmpeg_url": FFMPEG_URL, "ffmpeg_sha256": FFMPEG_SHA256,
+        "avc_motion": str(motion),
         "patches_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
-                           for p in (hevc_patch, av1_patch, nasm_patch)},
+                           for p in (hevc_patch, av1_patch, nasm_patch,
+                                     ROOT / "third_party/ffmpeg-motion/mpeg4-b-mvs.patch")},
     }, indent=2) + "\n", encoding="utf-8")
     github_outputs({"hevc-analyzer": hevc, "av1-inspect": av1, "ffmpeg": ffmpeg,
+                    "avc-motion": motion,
                     "notices-dir": work / "licenses", "manifest-path": manifest})
     print(f"Dependencies ready: {manifest}", flush=True)
 

@@ -7,6 +7,7 @@
 #include <QFileInfo>
 #include <QProcessEnvironment>
 #include <QRegularExpression>
+#include <QRect>
 #include <QStandardPaths>
 
 #include <algorithm>
@@ -20,6 +21,7 @@ struct AnalyzerRecord {
     int poc = 0;
     int ctuAddress = -1;
     QVector<int> values;
+    bool valid = true;
 };
 
 QVector<AnalyzerRecord> readRecords(const QString &path)
@@ -45,6 +47,7 @@ QVector<AnalyzerRecord> readRecords(const QString &path)
             const int value = token.toInt(&ok);
             if (ok)
                 record.values.push_back(value);
+            else record.valid = false;
         }
         records.push_back(std::move(record));
     }
@@ -71,6 +74,16 @@ int predictionUnitCount(int mode)
     if (mode >= 1 && mode <= 7)
         return 2;
     return 0;
+}
+
+QRect predictionUnitRect(int x, int y, int size, int mode, int pu)
+{
+    if (mode == 0) return {x, y, size, size};
+    if (mode == 3) return {x + (pu % 2) * size / 2, y + (pu / 2) * size / 2, size / 2, size / 2};
+    const bool vertical = mode == 2 || mode == 6 || mode == 7;
+    const int first = mode == 4 || mode == 6 ? size / 4 : mode == 5 || mode == 7 ? size * 3 / 4 : size / 2;
+    if (vertical) return {x + (pu ? first : 0), y, pu ? size - first : first, size};
+    return {x, y + (pu ? first : 0), size, pu ? size - first : first};
 }
 
 QString predictionName(const QVector<int> &values, int begin, int count)
@@ -312,6 +325,8 @@ HevcCuParseResult HevcCuProvider::parseOutput(QString *error) const
         QDir(m_activeDirectory).filePath(QStringLiteral("decoder_qp.txt")));
     const QVector<AnalyzerRecord> byteRecords = readRecords(
         QDir(m_activeDirectory).filePath(QStringLiteral("decoder_bit_scu.txt")));
+    const QVector<AnalyzerRecord> motionRecords = readRecords(
+        QDir(m_activeDirectory).filePath(QStringLiteral("decoder_mv.txt")));
     if (treeRecords.isEmpty()) {
         if (error)
             *error = QStringLiteral("参考解码器没有输出 decoder_cupu.txt");
@@ -345,6 +360,14 @@ HevcCuParseResult HevcCuProvider::parseOutput(QString *error) const
         int treePosition = 0;
         int leafPosition = 0;
         int predictionPosition = 0;
+        int motionPosition = 0;
+        const bool matchedMotion = motionRecords.size() == treeRecords.size() && recordIndex < motionRecords.size()
+            && motionRecords.at(recordIndex).valid
+            && motionRecords.at(recordIndex).poc == tree.poc
+            && motionRecords.at(recordIndex).ctuAddress == tree.ctuAddress;
+        const QVector<int> motion = matchedMotion ? motionRecords.at(recordIndex).values : QVector<int>();
+        bool motionValid = matchedMotion;
+        const int firstUnit = result.frames[frameGroup].size();
 
         std::function<void(int, int, int, int)> parseNode;
         parseNode = [&](int x, int y, int size, int depth) {
@@ -369,6 +392,27 @@ HevcCuParseResult HevcCuProvider::parseOutput(QString *error) const
             predictionPosition += puCount;
             ++leafPosition;
 
+            QVector<MotionVectorInfo> vectors;
+            // HM exports one direction followed by (refPOC, mvX, mvY) per
+            // active reference list, for every PU (including intra=0).
+            for (int pu = 0; pu < puCount && motionValid; ++pu) {
+                if (motionPosition >= motion.size()) { motionValid = false; break; }
+                const int direction = motion.at(motionPosition++);
+                if (direction < 0 || direction > 3) { motionValid = false; break; }
+                const QRect area = predictionUnitRect(x, y, size, mode, pu);
+                for (int list = 0; list < 2; ++list) if (direction & (1 << list)) {
+                    if (motionPosition + 3 > motion.size()) { motionValid = false; break; }
+                    MotionVectorInfo v;
+                    v.list = list; v.predictionUnit = pu;
+                    v.referencePoc = motion.at(motionPosition++);
+                    v.motionX = motion.at(motionPosition++); v.motionY = motion.at(motionPosition++);
+                    v.scale = 4;
+                    v.width = area.width(); v.height = area.height();
+                    v.centerX = area.x() + v.width / 2; v.centerY = area.y() + v.height / 2;
+                    vectors.append(v);
+                }
+            }
+
             if (mode == 15 || x >= m_stream->width || y >= m_stream->height)
                 return;
             HevcCodingUnitInfo unit;
@@ -384,9 +428,20 @@ HevcCuParseResult HevcCuProvider::parseOutput(QString *error) const
             unit.prediction = prediction;
             unit.qp = qp;
             unit.approximateBytes = approximateBytes;
+            unit.motionVectors = vectors;
             result.frames[frameGroup].push_back(std::move(unit));
         };
         parseNode(rootX, rootY, ctuSize, 0);
+        motionValid &= tree.valid && motionPosition == motion.size() && treePosition == tree.values.size();
+        for (int i = firstUnit; i < result.frames[frameGroup].size(); ++i) {
+            auto &unit = result.frames[frameGroup][i];
+            unit.motionVectorsReady = motionValid;
+            if (!motionValid) {
+                unit.motionVectors.clear();
+                unit.motionVectorsError = matchedMotion ? QStringLiteral("PU 运动记录不完整，拒绝绑定")
+                    : QStringLiteral("未找到匹配 POC / CTU 的 decoder_mv.txt 记录");
+            }
+        }
     }
     return result;
 }
@@ -414,22 +469,14 @@ void HevcCuProvider::processFinished(int exitCode, QProcess::ExitStatus status)
         const auto result = parseOutput(&parseError);
         const bool filteredOutput = m_activeOutputFiltered
             && result.frames.size() <= m_activeRequested.size();
-        const bool mapByPoc = !filteredOutput && result.frames.size() == result.pocs.size()
-            && std::all_of(m_activeRequested.cbegin(), m_activeRequested.cend(),
-                           [this](int index) { return m_stream->frames.at(index).poc >= 0; });
+        // HM writes CU records in decode order, not presentation order. Its
+        // POC MSB restarts at a seeked CRA and may differ from the full stream;
+        // never match that segment-local POC against the frame-list POC.
         for (int relative = 0; relative < result.frames.size(); ++relative) {
             int frameIndex = m_activeStart + relative;
             if (filteredOutput) {
                 frameIndex = relative < m_activeRequested.size()
                     ? m_activeRequested.at(relative) : -1;
-            } else if (mapByPoc) {
-                frameIndex = -1;
-                for (int index = m_activeStart; index <= m_activeEnd; ++index) {
-                    if (m_stream->frames.at(index).poc == result.pocs.at(relative)) {
-                        frameIndex = index;
-                        break;
-                    }
-                }
             }
             if (frameIndex >= m_activeStart && frameIndex <= m_activeEnd
                 && !result.frames.at(relative).isEmpty()) {

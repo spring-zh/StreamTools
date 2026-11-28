@@ -277,6 +277,7 @@ def main():
     parser.add_argument("--ffmpeg", default=os.environ.get("BITSCOPE_FFMPEG"), help="macOS ffmpeg 可执行文件")
     parser.add_argument("--hevc-analyzer", help="带 BitScope 补丁的 HM_180")
     parser.add_argument("--av1-inspect", help="带 BitScope 补丁的 libaom inspect")
+    parser.add_argument("--avc-motion", help="H.264 运动矢量提取器 bitscope-avc-motion")
     parser.add_argument("--dependency-notices", type=Path, help="额外依赖许可目录（CI 源码构建使用）")
     parser.add_argument("--arch", choices=("arm64", "x86_64"), default=platform.machine())
     parser.add_argument("--build-dir", type=Path, help="专用构建目录")
@@ -312,13 +313,15 @@ def main():
         raise RuntimeError("找不到 FFmpeg，请安装或用 --ffmpeg 指定。")
     hevc = choose_helper(args.hevc_analyzer, "BITSCOPE_HEVC_ANALYZER", "BITSCOPE_HEVC_ANALYZER", "HM_180", build_dir)
     av1 = choose_helper(args.av1_inspect, "BITSCOPE_AV1_INSPECT", "BITSCOPE_AV1_INSPECT_EXECUTABLE", "av1inspect", build_dir)
-    for helper in (ffmpeg, hevc, av1):
+    motion = choose_helper(args.avc_motion, "BITSCOPE_AVC_MOTION", "BITSCOPE_AVC_MOTION_EXECUTABLE", "bitscope-avc-motion", build_dir)
+    for helper in (ffmpeg, hevc, av1, motion):
         if args.arch not in run(["lipo", "-archs", helper], capture=True).split():
             raise RuntimeError(f"辅助程序架构与 {args.arch} 不符：{helper}")
     print("[1/6] 编译 Release 主程序…", flush=True)
     run(["cmake", "-S", ROOT, "-B", build_dir, "-DCMAKE_BUILD_TYPE=Release",
          f"-DCMAKE_PREFIX_PATH={qt_prefix}", f"-DCMAKE_OSX_ARCHITECTURES={args.arch}",
          f"-DBITSCOPE_HEVC_ANALYZER={hevc}", f"-DBITSCOPE_AV1_INSPECT_EXECUTABLE={av1}",
+         f"-DBITSCOPE_AVC_MOTION_EXECUTABLE={motion}",
          "-DBITSCOPE_BUILD_TESTS=OFF"])
     run(["cmake", "--build", build_dir, "--config", "Release", "--target", "BitScopeQt", "--parallel", args.jobs])
     source_app = build_dir / "BitScope.app"
@@ -336,6 +339,7 @@ def main():
     bundled_ffmpeg = app / "Contents/MacOS/ffmpeg"
     shutil.copy2(ffmpeg, bundled_ffmpeg)
     helpers = [bundled_ffmpeg, app / "Contents/Resources/tools/HM_180", app / "Contents/Resources/tools/av1inspect"]
+    helpers.append(app / "Contents/Resources/tools/bitscope-avc-motion")
     # This Widgets app uses Fusion style and JPEG thumbnails, not SVG/PDF/QML
     # or virtual keyboards. Avoid deploying unrelated installed Qt plugins.
     plugins = []
@@ -349,7 +353,7 @@ def main():
         shutil.copy2(source, target)
         plugins.append(target)
         plugin_sources.append(source)
-    sources = collect_sources([app / "Contents/MacOS/BitScope", ffmpeg, hevc, av1, *plugin_sources], app, qt_prefix)
+    sources = collect_sources([app / "Contents/MacOS/BitScope", ffmpeg, hevc, av1, motion, *plugin_sources], app, qt_prefix)
     print("[2/6] 收集 Qt、FFmpeg 及分析器的动态库…", flush=True)
     deploy_qt(deploy, app, qt_prefix, helpers + plugins, output / "deployment.log")
     (app / "Contents/Resources/qt.conf").write_text("[Paths]\nPlugins = PlugIns\n", encoding="utf-8")

@@ -1,6 +1,7 @@
 """CI helper guard tests; no network, compiler or macOS runtime required."""
 import importlib.util
 import json
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -23,6 +24,20 @@ with patch.dict(sys.modules, {"package_macos": load("package_macos")}):
 
 
 class MacCiTests(unittest.TestCase):
+    def test_workflow_builds_every_registered_ctest_driver(self):
+        cmake = (SCRIPTS.parent / "CMakeLists.txt").read_text(encoding="utf-8")
+        workflow = (SCRIPTS.parent / ".github/workflows/macos-build.yml").read_text(encoding="utf-8")
+        # Fold shell continuations, then inspect only explicit build commands.
+        commands = re.findall(r"cmake --build[^\n]+", workflow.replace("\\\n", " "))
+        built = set()
+        for command in commands:
+            if "--target" in command:
+                built.update(command.split("--target", 1)[1].split())
+        registered = set(re.findall(r"add_test\s*\(\s*NAME\s+\S+\s+COMMAND\s+(\w+)", cmake))
+        self.assertTrue(registered, "No CTest drivers found; update this guard for the CMake syntax")
+        self.assertFalse(registered - built,
+                         f"macOS workflow must build registered CTest drivers: {sorted(registered - built)}")
+
     def test_all_committed_synthetic_fixtures_have_valid_checksums(self):
         fixtures = json.loads((SCRIPTS.parent / "tests/fixtures/codec-smoke.json").read_text())["files"]
         self.assertEqual(set(fixtures), {"h264", "hevc", "mpeg4", "av1"})

@@ -11,6 +11,7 @@ param(
     [string]$FFmpeg = $env:BITSCOPE_FFMPEG,
     [string]$HevcAnalyzer = $env:BITSCOPE_HEVC_ANALYZER,
     [string]$Av1Inspect = $env:BITSCOPE_AV1_INSPECT,
+    [string]$AvcMotion = $env:BITSCOPE_AVC_MOTION,
     [string]$VcRedist,
     [string]$BuildDir = (Join-Path $PSScriptRoot 'build-windows-x64'),
     [string]$OutputDir = (Join-Path $PSScriptRoot 'dist'),
@@ -27,16 +28,18 @@ Assert-X64PE "$QtPrefix/bin/Qt6Core.dll"
 # Also select this Qt for configure/deployment, not another kit on PATH.
 $env:PATH = "$QtPrefix/bin;$env:PATH"
 $dependencyInfo = $null
-if (-not $FFmpeg -or -not $HevcAnalyzer -or -not $Av1Inspect) {
+if (-not $FFmpeg -or -not $HevcAnalyzer -or -not $Av1Inspect -or -not $AvcMotion) {
     $dependencyInfo = & "$PSScriptRoot/scripts/build-windows-deps.ps1" -Jobs $Jobs
     if (-not $FFmpeg) { $FFmpeg = $dependencyInfo.FFmpeg }
     if (-not $HevcAnalyzer) { $HevcAnalyzer = $dependencyInfo.HevcAnalyzer }
     if (-not $Av1Inspect) { $Av1Inspect = $dependencyInfo.Av1Inspect }
+    if (-not $AvcMotion) { $AvcMotion = $dependencyInfo.AvcMotion }
 }
 $FFmpeg = Require-File $FFmpeg
 $HevcAnalyzer = Require-File $HevcAnalyzer
 $Av1Inspect = Require-File $Av1Inspect
-foreach ($binary in @($FFmpeg, $HevcAnalyzer, $Av1Inspect)) { Assert-X64PE $binary }
+$AvcMotion = Require-File $AvcMotion
+foreach ($binary in @($FFmpeg, $HevcAnalyzer, $Av1Inspect, $AvcMotion)) { Assert-X64PE $binary }
 $BuildDir = [IO.Path]::GetFullPath($BuildDir)
 if ($BuildDir -eq $PSScriptRoot) { throw 'Build directory must not be the source root.' }
 Write-Host '[1/5] Building BitScope Release (Windows x64)...'
@@ -44,6 +47,7 @@ $testsOption = if ($SkipTests) { 'OFF' } else { 'ON' }
 Invoke-Native cmake @('-S', $PSScriptRoot, '-B', $BuildDir, '-G', 'Visual Studio 17 2022', '-A', 'x64',
     "-DCMAKE_PREFIX_PATH=$QtPrefix", "-DQt6_DIR=$QtPrefix/lib/cmake/Qt6",
     "-DBITSCOPE_HEVC_ANALYZER=$HevcAnalyzer", "-DBITSCOPE_AV1_INSPECT_EXECUTABLE=$Av1Inspect",
+    "-DBITSCOPE_AVC_MOTION_EXECUTABLE=$AvcMotion",
     "-DBITSCOPE_BUILD_TESTS=$testsOption")
 Invoke-Native cmake @('--build', $BuildDir, '--config', 'Release', '--parallel', "$Jobs")
 $builtExe = Require-File "$BuildDir/Release/BitScope.exe"
@@ -56,8 +60,9 @@ Copy-Item -LiteralPath $builtExe -Destination "$package/BitScope.exe"
 Copy-Item -LiteralPath $FFmpeg -Destination "$package/ffmpeg.exe"
 Copy-Item -LiteralPath $HevcAnalyzer -Destination "$package/tools/HM_180.exe"
 Copy-Item -LiteralPath $Av1Inspect -Destination "$package/tools/av1inspect.exe"
+Copy-Item -LiteralPath $AvcMotion -Destination "$package/bitscope-avc-motion.exe"
 # For explicitly supplied shared builds, preserve helper-adjacent DLLs too.
-foreach ($entry in @(@($FFmpeg, $package), @($HevcAnalyzer, "$package/tools"), @($Av1Inspect, "$package/tools"))) {
+foreach ($entry in @(@($FFmpeg, $package), @($HevcAnalyzer, "$package/tools"), @($Av1Inspect, "$package/tools"), @($AvcMotion, $package))) {
     foreach ($dll in Get-ChildItem -LiteralPath (Split-Path $entry[0]) -Filter '*.dll' -File) {
         $destination = Join-Path $entry[1] $dll.Name
         if ((Test-Path $destination) -and (Get-FileHash $destination).Hash -ne (Get-FileHash $dll.FullName).Hash) {
@@ -66,8 +71,9 @@ foreach ($entry in @(@($FFmpeg, $package), @($HevcAnalyzer, "$package/tools"), @
         Copy-Item -LiteralPath $dll.FullName -Destination $destination
     }
 }
-Copy-Item -LiteralPath "$PSScriptRoot/third_party/hevc-cu-analyzer", "$PSScriptRoot/third_party/aom-inspection" -Destination "$package/licenses" -Recurse
+Copy-Item -LiteralPath "$PSScriptRoot/third_party/hevc-cu-analyzer", "$PSScriptRoot/third_party/aom-inspection", "$PSScriptRoot/third_party/ffmpeg-motion" -Destination "$package/licenses" -Recurse
 if ($dependencyInfo) {
+    Get-ChildItem -LiteralPath $dependencyInfo.MotionNotices | Copy-Item -Destination "$package/licenses/ffmpeg-motion" -Recurse
     Copy-Item -LiteralPath $dependencyInfo.Manifest -Destination "$package/licenses/dependencies.json"
     New-Item -ItemType Directory -Path "$package/licenses/ffmpeg" | Out-Null
     Get-ChildItem -LiteralPath $dependencyInfo.FFmpegRoot -File | Where-Object {
@@ -108,7 +114,8 @@ Only allow software whose origin you trust; do not disable Windows security.
 Third-party notices and patches are under licenses. Before public/commercial
 distribution, review the actual Qt/FFmpeg/helper licenses and supply any
 required source and license materials. Automatic collection is not a full
-license compliance review. FFmpeg 8.0.1 essentials is a third-party GPL build.
+license compliance review. FFmpeg 8.0.1 essentials is a third-party GPL build;
+the independent motion helper uses a patched minimal LGPL FFmpeg build.
 '@ | Set-Content -Encoding utf8 "$package/README.txt"
 Write-Host '[4/5] Checking the packaged program and video analyzers...'
 if (-not $SkipTests) {
