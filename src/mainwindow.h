@@ -18,6 +18,7 @@ class QTabWidget;
 class QTextBrowser;
 class QTreeWidget;
 class QTreeWidgetItem;
+class QToolButton;
 
 namespace bitscope {
 
@@ -45,6 +46,10 @@ protected:
     void closeEvent(QCloseEvent *event) override;
 
 private:
+    friend struct MainWindowStatusTest;
+    void setActivityStatus(const QString &message);
+    void refreshStatus();
+    void showPreviewErrorDetails();
     void buildUi();
     void buildMenus();
     void applyTheme();
@@ -99,6 +104,8 @@ private:
     TimelineWidget *m_timeline = nullptr;
     QProgressBar *m_progress = nullptr;
     QLabel *m_status = nullptr;
+    QToolButton *m_statusDetails = nullptr;
+    QString m_activityStatus = QStringLiteral("就绪");
     QString m_lastPath;
     int m_currentFrame = -1;
     bool m_preferFileView = false;

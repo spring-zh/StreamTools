@@ -4,6 +4,7 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QImage>
 #include <QSet>
 #include <QTimer>
@@ -39,10 +40,10 @@ int main(int argc, char **argv)
     QTemporaryDir referenceDir;
     QVector<int> displayOrder;
     if (argc == 5) {
-        // Test fixture only: compare each preview to ordinary display-order
-        // decoding, so coded-order MPEG-4 output cannot silently swap B frames.
-        if (!stream->containerFile || stream->frames.size() > 64 || !referenceDir.isValid()) {
-            qCritical() << "reference comparison requires a small container fixture (<=64 frames)";
+        // Decode normally from file start, but save only the requested frames.
+        // This also checks random-access/open-GOP previews on real long files.
+        if (!stream->containerFile || lastFrame - firstFrame >= 128 || !referenceDir.isValid()) {
+            qCritical() << "reference comparison requires a container and <=128 requested frames";
             return 9;
         }
         for (int i = 0; i < stream->frames.size(); ++i)
@@ -50,11 +51,21 @@ int main(int argc, char **argv)
         std::stable_sort(displayOrder.begin(), displayOrder.end(), [&](int a, int b) {
             return stream->frames[a].pts < stream->frames[b].pts;
         });
+        QStringList select;
+        QVector<int> requestedOrder;
+        for (int ordinal = 0; ordinal < displayOrder.size(); ++ordinal) {
+            const int frame = displayOrder.at(ordinal);
+            if (frame < firstFrame || frame > lastFrame) continue;
+            select.push_back(QStringLiteral("eq(n\\,%1)").arg(ordinal));
+            requestedOrder.push_back(frame);
+        }
+        displayOrder = requestedOrder;
         QProcess reference;
         reference.start(provider.ffmpegPath(), {"-hide_banner", "-nostats", "-loglevel", "error",
             "-threads", "1", "-i", QString::fromLocal8Bit(argv[1]), "-an",
-            "-vf", "scale=320:-2", "-fps_mode", "passthrough", "-q:v", "5",
-            "-start_number", "0", "-frames:v", QString::number(stream->frames.size()),
+            "-vf", QStringLiteral("select=%1,scale=320:-2").arg(select.join('+')),
+            "-fps_mode", "passthrough", "-q:v", "5",
+            "-start_number", "0", "-frames:v", QString::number(displayOrder.size()),
             "-y", QDir(referenceDir.path()).filePath("%05d.jpg")});
         if (!reference.waitForFinished(60000) || reference.exitStatus() != QProcess::NormalExit
             || reference.exitCode() != 0) {
@@ -153,10 +164,15 @@ int main(int argc, char **argv)
         qCritical() << "preview extraction timed out";
         application.quit();
     });
+    QObject::connect(&provider, &PreviewProvider::statusChanged, &application,
+                     [](const QString &status) { qInfo().noquote() << status; });
+    QElapsedTimer elapsed;
+    elapsed.start();
     if (firstFrame == lastFrame)
         provider.requestFrame(firstFrame);
     else
         provider.requestRange(firstFrame, lastFrame);
     application.exec();
+    qInfo() << "preview job elapsed ms (excluding reference decode):" << elapsed.elapsed();
     return exitCode;
 }

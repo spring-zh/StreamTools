@@ -1,11 +1,14 @@
 #include "previewprovider.h"
 #include "hevcaccess.h"
+#include "mpeg4access.h"
 
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QImageReader>
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QRegularExpression>
 #include <QStandardPaths>
 
@@ -92,6 +95,8 @@ int PreviewProvider::nearestStart(int frameIndex) const
         return 0;
     if (m_stream->codec == Codec::Hevc)
         return nearestHevcDecodeStart(m_stream, frameIndex);
+    if (m_stream->codec == Codec::Mpeg4Visual)
+        return nearestMpeg4DecodeStart(m_stream, frameIndex);
     for (int index = frameIndex; index >= 0; --index) {
         const auto &frame = m_stream->frames.at(index);
         // IDR/IRAP is immediately safe. A Recovery Point is only safe for a
@@ -116,6 +121,57 @@ QByteArray PreviewProvider::accessUnit(int frameIndex,bool includeParameters) co
 
 QByteArray PreviewProvider::segment(int first,int last) const {QByteArray out;for(int i=first;i<=last;++i)out.append(accessUnit(i,i==first));return out;}
 
+QString PreviewProvider::failureReason(const QString &summary, const QString &stderrText,
+                                       const QString &outputPath) const
+{
+    // qp+mb_type logs can contain millions of cells. Keep actionable errors and
+    // a bounded tail, not the initial FFmpeg banner or whole macroblock dump.
+    const QRegularExpression errorPattern(QStringLiteral(
+        "error|failed|invalid|cannot|could not|not found|no such|unsupported|"
+        "unknown (?:decoder|encoder|format|option)|permission denied|missing|output file is empty|nothing was encoded"),
+        QRegularExpression::CaseInsensitiveOption);
+    const QRegularExpression zeroErrors(QStringLiteral("\\b0 decod(?:e|ing) errors\\b"),
+                                       QRegularExpression::CaseInsensitiveOption);
+    QStringList errors, tail;
+    for (const QString &line : stderrText.split(QLatin1Char('\n'))) {
+        const QString trimmed = line.trimmed();
+        if (trimmed.isEmpty()) continue;
+        const QString bounded = trimmed.left(1000);
+        tail.append(bounded);
+        if (tail.size() > 12) tail.removeFirst();
+        // FFmpeg versions use both "0 decode errors" and "0 decoding errors".
+        if (errorPattern.match(trimmed).hasMatch()
+            && !zeroErrors.match(trimmed).hasMatch()
+            && !trimmed.startsWith(QStringLiteral("Reading option"))) {
+            errors.append(bounded);
+            if (errors.size() > 8) errors.removeFirst();
+        }
+    }
+    QString reason = summary;
+    if (!errors.isEmpty()) reason += QStringLiteral(" · ") + errors.last();
+    reason += QStringLiteral("\n解码范围：F%1–F%2；预计输出 %3 帧\nFFmpeg：%4\n输入片段：%5")
+                  .arg(m_activeStart).arg(m_activeEnd).arg(m_activeOutputOrder.size())
+                  .arg(m_process.program(), m_activeInput);
+    if (!outputPath.isEmpty()) reason += QStringLiteral("\n预期图片：") + outputPath;
+    if (!m_processIoError.isEmpty()) reason += QStringLiteral("\n进程错误：") + m_processIoError;
+    reason += QStringLiteral("\n参数：") + QString::fromUtf8(QJsonDocument(
+        QJsonArray::fromStringList(m_process.arguments())).toJson(QJsonDocument::Compact));
+    reason += QStringLiteral("\nFFmpeg 关键日志：\n")
+        + (errors.isEmpty() ? QStringLiteral("未报告明确错误。") : errors.join(QLatin1Char('\n')));
+    reason += QStringLiteral("\nFFmpeg 日志末尾（最多 12 行，每行最多 1000 字符）：\n")
+        + (tail.isEmpty() ? QStringLiteral("无 stderr 输出。") : tail.join(QLatin1Char('\n')));
+    return reason;
+}
+
+void PreviewProvider::failActivePreviews(const QString &reason)
+{
+    for (int index : m_activeRequested) {
+        m_failed.insert(index);
+        Q_EMIT previewFailed(index, reason);
+        Q_EMIT decodedUnitsUnavailable(index, reason.left(300));
+    }
+}
+
 void PreviewProvider::processQueue(){if(!m_stream||m_pending.isEmpty()||m_process.state()!=QProcess::NotRunning)return;const QString executable=ffmpegPath();if(executable.isEmpty()){const auto pending=m_pending;m_pending.clear();const QString reason=QStringLiteral("未找到 FFmpeg。macOS 可执行 brew install ffmpeg；也可把 ffmpeg 放到应用旁边，或设置 BITSCOPE_FFMPEG。 ");for(int i:pending){m_failed.insert(i);Q_EMIT previewFailed(i,reason);}Q_EMIT statusChanged(QStringLiteral("预览不可用：未找到 FFmpeg（码流分析不受影响）"));Q_EMIT queueIdle();return;}
     QList<int> sorted=m_pending.values();std::sort(sorted.begin(),sorted.end());const int anchor=m_pending.contains(m_priorityFrame)?m_priorityFrame:sorted.first();m_priorityFrame=-1;m_activeStart=nearestStart(anchor);m_activeRequested.clear();m_activeEnd=anchor;
     for(int index:sorted){if(nearestStart(index)==m_activeStart&&index<=anchor+64){m_activeRequested.push_back(index);m_activeEnd=std::max(m_activeEnd,index);}}
@@ -126,11 +182,32 @@ void PreviewProvider::processQueue(){if(!m_stream||m_pending.isEmpty()||m_proces
             || !hevcFrameSuppressedAtStart(m_stream,m_activeStart,index))
             m_activeOutputOrder.push_back(index);
     }
+    if (m_stream->codec == Codec::Mpeg4Visual)
+        m_activeOutputOrder = mpeg4PreviewOutputOrder(m_stream, m_activeStart, m_activeEnd);
     if(m_stream->containerFile
         && (m_stream->codec==Codec::Avc||m_stream->codec==Codec::Hevc))
         std::stable_sort(m_activeOutputOrder.begin(),m_activeOutputOrder.end(),[this](int a,int b){return m_stream->frames.at(a).pts<m_stream->frames.at(b).pts;});
     const QString suffix=m_stream->codec==Codec::Avc?QStringLiteral("h264"):(m_stream->codec==Codec::Hevc?QStringLiteral("h265"):(m_stream->codec==Codec::Mpeg4Visual?QStringLiteral("m4v"):QStringLiteral("obu")));
-    const int job=m_job++;m_activePrefix=QDir(m_temp.path()).filePath(QStringLiteral("preview_%1_").arg(job));m_activeInput=QDir(m_temp.path()).filePath(QStringLiteral("preview_%1.%2").arg(job).arg(suffix));QFile input(m_activeInput);if(!input.open(QIODevice::WriteOnly)){for(int index:m_activeRequested)Q_EMIT previewFailed(index,input.errorString());if(!m_pending.isEmpty())m_queueTimer.start();else Q_EMIT queueIdle();return;}input.write(segment(m_activeStart,m_activeEnd));input.close();
+    m_processIoError.clear();
+    m_process.setProgram(executable);
+    m_process.setArguments({});
+    const int job=m_job++;m_activePrefix=QDir(m_temp.path()).filePath(QStringLiteral("preview_%1_").arg(job));m_activeInput=QDir(m_temp.path()).filePath(QStringLiteral("preview_%1.%2").arg(job).arg(suffix));
+    QFile input(m_activeInput);
+    QString inputError;
+    if (!m_temp.isValid()) inputError = QStringLiteral("无法创建预览临时目录：%1").arg(m_temp.errorString());
+    else if (!input.open(QIODevice::WriteOnly)) inputError = QStringLiteral("无法创建预览输入文件：%1").arg(input.errorString());
+    else {
+        const QByteArray data = segment(m_activeStart, m_activeEnd);
+        if (input.write(data) != data.size() || !input.flush())
+            inputError = QStringLiteral("写入预览输入文件失败：%1").arg(input.errorString());
+        input.close();
+    }
+    if (!inputError.isEmpty()) {
+        failActivePreviews(failureReason(inputError));
+        clearActiveFiles();
+        if (!m_pending.isEmpty()) m_queueTimer.start(); else Q_EMIT queueIdle();
+        return;
+    }
     const QString output=m_activePrefix+QStringLiteral("%05d.jpg");const QString fps=QString::number(m_stream->fps,'f',3);
     const bool macroblockDebug=m_stream->codec==Codec::Avc||m_stream->codec==Codec::Mpeg4Visual;
     // Progress output uses carriage returns and can share a line with MB logs.
@@ -144,7 +221,8 @@ void PreviewProvider::processQueue(){if(!m_stream||m_pending.isEmpty()||m_proces
         ? QStringLiteral("+output_corrupt+low_delay") : QStringLiteral("+output_corrupt");
     const QString demuxer=m_stream->codec==Codec::Avc?QStringLiteral("h264"):(m_stream->codec==Codec::Hevc?QStringLiteral("hevc"):(m_stream->codec==Codec::Mpeg4Visual?QStringLiteral("m4v"):QStringLiteral("obu")));
     args<<QStringLiteral("-fflags")<<QStringLiteral("+genpts")<<QStringLiteral("-err_detect")<<QStringLiteral("ignore_err")<<QStringLiteral("-flags")<<decoderFlags<<QStringLiteral("-r")<<fps<<QStringLiteral("-f")<<demuxer<<QStringLiteral("-i")<<m_activeInput<<QStringLiteral("-an")<<QStringLiteral("-vf")<<QStringLiteral("scale=320:-2")<<QStringLiteral("-fps_mode")<<QStringLiteral("passthrough")<<QStringLiteral("-q:v")<<QStringLiteral("5")<<QStringLiteral("-start_number")<<QStringLiteral("0")<<QStringLiteral("-frames:v")<<QString::number(m_activeOutputOrder.size())<<QStringLiteral("-y")<<output;
-    Q_EMIT statusChanged(QStringLiteral("正在生成预览 F%1–F%2 · %3").arg(m_activeStart).arg(m_activeEnd).arg(executable));m_process.start(executable,args);
+    m_process.setArguments(args);
+    Q_EMIT statusChanged(QStringLiteral("正在生成预览 F%1–F%2 · %3").arg(m_activeStart).arg(m_activeEnd).arg(executable));m_process.start();
 }
 
 void PreviewProvider::processFinished(int exitCode, QProcess::ExitStatus status)
@@ -160,22 +238,27 @@ void PreviewProvider::processFinished(int exitCode, QProcess::ExitStatus status)
     }
     const QByteArray stderrData = m_process.readAllStandardError();
     const QString stderrText = QString::fromLocal8Bit(stderrData).trimmed();
-    if (status != QProcess::NormalExit || exitCode != 0) {
-        const QString reason = stderrText.isEmpty()
-            ? QStringLiteral("FFmpeg 退出码 %1").arg(exitCode) : stderrText;
-        for (int index : m_activeRequested) {
-            m_failed.insert(index);
-            Q_EMIT previewFailed(index, reason);
-            Q_EMIT decodedUnitsUnavailable(index, reason.left(300));
-        }
+    const bool mpeg4 = m_stream && m_stream->codec == Codec::Mpeg4Visual;
+    const int imageCount = mpeg4 ? QDir(m_temp.path()).entryList(
+        {QFileInfo(m_activePrefix).fileName() + QStringLiteral("*.jpg")}, QDir::Files).size() : -1;
+    if (status != QProcess::NormalExit || exitCode != 0 || !m_processIoError.isEmpty()) {
+        const QString summary = status == QProcess::CrashExit
+            ? QStringLiteral("FFmpeg 进程异常终止（退出码 %1）：%2").arg(exitCode).arg(m_process.errorString())
+            : QStringLiteral("FFmpeg 解码失败（退出码 %1）").arg(exitCode);
+        failActivePreviews(failureReason(summary, stderrText));
+    } else if (mpeg4 && imageCount != m_activeOutputOrder.size()) {
+        // Unexpected skips (e.g. damaged or uncoded VOPs) must never silently
+        // bind following pictures or macroblocks to the wrong source frames.
+        failActivePreviews(failureReason(QStringLiteral(
+            "MPEG-4 输出帧数不匹配：预计 %1，实际 %2；已停止绑定图片和宏块，避免错帧")
+            .arg(m_activeOutputOrder.size()).arg(imageCount), stderrText));
     } else {
         if (m_stream && (m_stream->codec == Codec::Avc
                          || m_stream->codec == Codec::Mpeg4Visual)) {
-            const int expected = m_activeEnd - m_activeStart + 1;
+            const int expected = m_activeOutputOrder.size();
             const auto decoded = parseAvcDecodedUnits(stderrData, expected);
             for (int relative = 0; relative < decoded.size() && relative < expected; ++relative) {
-                const int frameIndex = relative < m_activeOutputOrder.size()
-                    ? m_activeOutputOrder.at(relative) : m_activeStart + relative;
+                const int frameIndex = m_activeOutputOrder.at(relative);
                 if (!decoded.at(relative).isEmpty())
                     Q_EMIT decodedUnitsReady(frameIndex, decoded.at(relative));
             }
@@ -186,8 +269,22 @@ void PreviewProvider::processFinished(int exitCode, QProcess::ExitStatus status)
                         QStringLiteral("FFmpeg 没有导出该帧的宏块数据"));
             }
         }
+        QString diagnosticContext;
+        const auto pictureFailure = [&](const QString &summary, const QString &path = QString()) {
+            // A batch can miss many thumbnails; scan its large MB debug log
+            // only once, and only if an image actually fails.
+            if (diagnosticContext.isEmpty()) diagnosticContext = failureReason({}, stderrText);
+            return summary + diagnosticContext
+                + (path.isEmpty() ? QString() : QStringLiteral("\n预期图片：") + path);
+        };
         for (int index : m_activeRequested) {
             const int relative = m_activeOutputOrder.indexOf(index);
+            if (relative < 0) {
+                m_failed.insert(index);
+                Q_EMIT previewFailed(index, pictureFailure(
+                    QStringLiteral("F%1 不在当前解码段的输出映射中（可能为随机访问起点抑制的图片）").arg(index)));
+                continue;
+            }
             const QString path = m_activePrefix
                 + QStringLiteral("%1.jpg").arg(relative, 5, 10, QChar('0'));
             QImageReader reader(path);
@@ -195,9 +292,12 @@ void PreviewProvider::processFinished(int exitCode, QProcess::ExitStatus status)
             const QImage image = reader.read();
             if (image.isNull()) {
                 m_failed.insert(index);
-                Q_EMIT previewFailed(index,
-                    QStringLiteral("FFmpeg 未输出 Frame %1：%2")
-                        .arg(index).arg(reader.errorString()));
+                const QFileInfo outputInfo(path);
+                const QString summary = !outputInfo.exists()
+                    ? QStringLiteral("FFmpeg 正常退出，但未生成 F%1 的预览图片（输出序号 %2）").arg(index).arg(relative)
+                    : QStringLiteral("F%1 预览图片读取失败（%2 字节）：%3")
+                          .arg(index).arg(outputInfo.size()).arg(reader.errorString());
+                Q_EMIT previewFailed(index, pictureFailure(summary, path));
             } else {
                 m_cached.insert(index);
                 Q_EMIT thumbnailReady(index, image);
@@ -351,7 +451,17 @@ QVector<QVector<DecodedUnitInfo>> PreviewProvider::parseAvcDecodedUnits(const QB
     return result;
 }
 
-void PreviewProvider::processError(QProcess::ProcessError error){if(m_cancelled)return;if(error==QProcess::FailedToStart){for(int index:m_activeRequested){m_failed.insert(index);Q_EMIT previewFailed(index,QStringLiteral("FFmpeg 无法启动：%1").arg(m_process.errorString()));}clearActiveFiles();if(!m_pending.isEmpty())m_queueTimer.start();}}
+void PreviewProvider::processError(QProcess::ProcessError error)
+{
+    if (m_cancelled) return;
+    m_processIoError = m_process.errorString();
+    if (error == QProcess::FailedToStart) {
+        failActivePreviews(failureReason(QStringLiteral("FFmpeg 无法启动：%1").arg(m_process.errorString()),
+                                        QString::fromLocal8Bit(m_process.readAllStandardError())));
+        clearActiveFiles();
+        if (!m_pending.isEmpty()) m_queueTimer.start(); else Q_EMIT queueIdle();
+    }
+}
 
 void PreviewProvider::clearActiveFiles(){if(!m_activeInput.isEmpty())QFile::remove(m_activeInput);if(!m_activePrefix.isEmpty()){QDir dir(m_temp.path());const QString stem=QFileInfo(m_activePrefix).fileName();for(const QString &name:dir.entryList({stem+QStringLiteral("*.jpg")},QDir::Files))dir.remove(name);}m_activeInput.clear();m_activePrefix.clear();}
 

@@ -37,10 +37,14 @@ private Q_SLOTS:
 
 private:
     friend struct PreviewProviderLogTest;
+    friend struct PreviewProviderDiagnosticsTest;
     int nearestStart(int frameIndex) const;
     QByteArray accessUnit(int frameIndex, bool includeParameters) const;
     QByteArray segment(int first, int last) const;
     void clearActiveFiles();
+    QString failureReason(const QString &summary, const QString &stderrText = {},
+                          const QString &outputPath = {}) const;
+    void failActivePreviews(const QString &reason);
     QVector<QVector<DecodedUnitInfo>> parseAvcDecodedUnits(const QByteArray &log,
                                                            int expectedFrames) const;
 
@@ -59,6 +63,7 @@ private:
     bool m_cancelled = false;
     QString m_activeInput;
     QString m_activePrefix;
+    QString m_processIoError;
     QTimer m_queueTimer;
 };
 

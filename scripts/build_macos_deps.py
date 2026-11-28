@@ -47,7 +47,7 @@ def build_ffmpeg(work, aom_prefix, jobs, archive=None):
                "--enable-parser=h264,hevc,mpeg4video,av1",
                "--enable-demuxer=mov,h264,hevc,m4v,ivf,av1,obu",
                "--enable-muxer=image2", "--enable-encoder=mjpeg",
-               "--enable-filter=scale,format,null,buffer,buffersink", "--enable-protocol=file,pipe",
+               "--enable-filter=scale,format,null,buffer,buffersink,select", "--enable-protocol=file,pipe",
                "--enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,av1_frame_merge,av1_frame_split"]
     run([source / "configure", *options], env=env, cwd=build)
     run(["make", "-j", jobs, "ffmpeg"], env=env, cwd=build)

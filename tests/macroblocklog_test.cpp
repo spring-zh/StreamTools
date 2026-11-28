@@ -1,4 +1,5 @@
 #include "previewprovider.h"
+#include "mpeg4access.h"
 
 #include <QCoreApplication>
 #include <QDebug>
@@ -45,6 +46,26 @@ static QByteArray frame(const QByteArray &prefix, int qp = 12,
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
+    auto openGop = std::make_shared<StreamInfo>();
+    openGop->codec = Codec::Mpeg4Visual;
+    // Coded order: I P B B I B B P B B I B B P B B.
+    // The B pictures after each later I use a reference from the preceding GOP.
+    const QStringList types{"I", "P", "B", "B", "I", "B", "B", "P", "B", "B", "I", "B", "B", "P", "B", "B"};
+    for (const auto &type : types) {
+        FrameInfo frame;
+        frame.index = openGop->frames.size();
+        frame.type = type;
+        frame.randomAccess = type == "I";
+        frame.referencePicture = type != "B";
+        openGop->frames.push_back(frame);
+    }
+    check(nearestMpeg4DecodeStart(openGop, 4) == 4, "I keeps nearest GOP fast path");
+    check(nearestMpeg4DecodeStart(openGop, 5) == 0, "leading B requests preceding reference GOP");
+    check(nearestMpeg4DecodeStart(openGop, 11) == 4, "leading B does not fall back to file start");
+    check(nearestMpeg4DecodeStart(openGop, 14) == 10, "ordinary B keeps nearest GOP fast path");
+    check(mpeg4PreviewOutputOrder(openGop, 4, 9) == QVector<int>({4, 7, 8, 9}), "omit initial leading B from image and MB mapping");
+    check(mpeg4PreviewOutputOrder(openGop, 4, 12) == QVector<int>({4, 7, 8, 9, 10, 11, 12}), "retain leading B once references exist");
+    check(mpeg4PreviewOutputOrder(openGop, 0, 3) == QVector<int>({0, 1, 2, 3}), "first GOP unchanged");
     for (Codec codec : {Codec::Avc, Codec::Mpeg4Visual}) {
         const QByteArray name = codec == Codec::Avc ? "h264" : "mpeg4";
         for (const QByteArray &address : {QByteArray("0000021AB0CDEF00"),

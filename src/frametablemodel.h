@@ -21,6 +21,7 @@ public:
     StreamPtr stream() const { return m_stream; }
     void setThumbnail(int frameIndex, const QImage &image);
     void setThumbnailError(int frameIndex, const QString &error);
+    QString thumbnailError(int frameIndex) const { return m_thumbnailErrors.value(frameIndex); }
     QImage thumbnail(int frameIndex) const;
 
     int rowCount(const QModelIndex &parent = {}) const override;

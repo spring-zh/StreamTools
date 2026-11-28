@@ -14,10 +14,13 @@
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
+#include <QClipboard>
 #include <QCloseEvent>
 #include <QColor>
 #include <QComboBox>
 #include <QDir>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QFileDialog>
@@ -165,6 +168,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     connect(m_previews, &PreviewProvider::thumbnailReady, this, [this](int frame, const QImage &image) {
         m_model->setThumbnail(frame, image);
         m_macroView->setFrameImage(frame, image);
+        refreshStatus();
         if (frame == m_currentFrame)
             requestCurrentBlockData(frame);
     });
@@ -194,12 +198,12 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
         }
     });
     connect(m_model, &FrameTableModel::thumbnailEvicted, m_previews, &PreviewProvider::forgetFrame);
-    connect(m_previews, &PreviewProvider::statusChanged, m_status, &QLabel::setText);
+    connect(m_previews, &PreviewProvider::statusChanged, this, &MainWindow::setActivityStatus);
     connect(m_previews, &PreviewProvider::previewFailed, this, [this](int frame, const QString &reason) {
-        m_model->setThumbnailError(frame, reason.left(500));
+        m_model->setThumbnailError(frame, reason);
         m_macroView->setFrameError(frame, reason.left(500));
-        if (m_table->currentIndex().data(FrameTableModel::ItemIndexRole).toInt() == frame) {
-            m_status->setText(QStringLiteral("Frame %1 预览失败：%2").arg(frame).arg(reason.left(180)));
+        refreshStatus();
+        if (m_currentFrame == frame) {
             requestCurrentBlockData(frame);
         }
     });
@@ -235,7 +239,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
                 requestVisibleBlockData();
         }
     });
-    connect(m_hevcCuProvider, &HevcCuProvider::statusChanged, m_status, &QLabel::setText);
+    connect(m_hevcCuProvider, &HevcCuProvider::statusChanged, this, &MainWindow::setActivityStatus);
     connect(m_av1BlockProvider, &Av1BlockProvider::codingBlocksReady, this,
             [this](int frameIndex, const QVector<Av1CodingBlockInfo> &blocks) {
         if (!m_stream || frameIndex < 0 || frameIndex >= m_stream->frames.size())
@@ -266,12 +270,57 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
                 requestVisibleBlockData();
         }
     });
-    connect(m_av1BlockProvider, &Av1BlockProvider::statusChanged, m_status, &QLabel::setText);
+    connect(m_av1BlockProvider, &Av1BlockProvider::statusChanged, this, &MainWindow::setActivityStatus);
     clearDetails(QStringLiteral("拖入或打开 MP4、H.264、H.265、MPEG-4 Part 2 或 AV1 视频开始分析"));
 }
 
 MainWindow::~MainWindow() {
     if (m_watcher.isRunning()) m_watcher.waitForFinished();
+}
+
+void MainWindow::setActivityStatus(const QString &message)
+{
+    m_activityStatus = message;
+    refreshStatus();
+}
+
+void MainWindow::refreshStatus()
+{
+    // A current-frame preview error takes priority over background block jobs.
+    // Keep it through retries; only a successful thumbnail or a new stream
+    // clears it. Other frames' errors must not replace the selected frame.
+    const QString error = m_model->thumbnailError(m_currentFrame);
+    const bool failed = !error.isEmpty();
+    const QString text = failed
+        ? QStringLiteral("F%1 预览加载失败：%2").arg(m_currentFrame)
+              .arg(error.section(QLatin1Char('\n'), 0, 0).simplified())
+        : m_activityStatus;
+    m_status->setText(text);
+    m_status->setToolTip(failed ? text + QStringLiteral("\n点击“错误详情”查看并复制诊断信息。") : text);
+    m_status->setStyleSheet(failed ? QStringLiteral("color:#ff7b72;") : QString());
+    m_statusDetails->setVisible(failed);
+}
+
+void MainWindow::showPreviewErrorDetails()
+{
+    const QString error = m_model->thumbnailError(m_currentFrame);
+    if (error.isEmpty()) return;
+    const QString details = QStringLiteral("文件：%1\n当前帧：F%2\n\n%3")
+                                .arg(m_lastPath).arg(m_currentFrame).arg(error);
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("F%1 预览错误详情").arg(m_currentFrame));
+    dialog.resize(900, 480);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *text = new QPlainTextEdit(&dialog);
+    text->setReadOnly(true);
+    text->setPlainText(details);
+    layout->addWidget(text);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    auto *copy = buttons->addButton(QStringLiteral("复制全部"), QDialogButtonBox::ActionRole);
+    connect(copy, &QPushButton::clicked, &dialog, [details] { QApplication::clipboard()->setText(details); });
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    dialog.exec();
 }
 
 void MainWindow::requestFileView()
@@ -556,11 +605,20 @@ void MainWindow::buildUi() {
     root->addWidget(timelineBox);
 
     m_status = new QLabel(QStringLiteral("就绪"), this);
+    m_status->setTextFormat(Qt::PlainText);
+    m_status->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_status->setMinimumWidth(0);
+    m_status->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    m_statusDetails = new QToolButton(this);
+    m_statusDetails->setText(QStringLiteral("错误详情"));
+    m_statusDetails->hide();
+    connect(m_statusDetails, &QToolButton::clicked, this, &MainWindow::showPreviewErrorDetails);
     m_progress = new QProgressBar(this);
     m_progress->setMaximumWidth(160);
     m_progress->setTextVisible(false);
     m_progress->hide();
     statusBar()->addWidget(m_status, 1);
+    statusBar()->addPermanentWidget(m_statusDetails);
     statusBar()->addPermanentWidget(m_progress);
 
     setCentralWidget(central);
@@ -681,7 +739,7 @@ void MainWindow::chooseFile() {
 
 void MainWindow::openFile(const QString &path) {
     if (m_watcher.isRunning()) {
-        m_status->setText(QStringLiteral("当前文件仍在解析，请稍候"));
+        setActivityStatus(QStringLiteral("当前文件仍在解析，请稍候"));
         return;
     }
     const QFileInfo info(path);
@@ -693,7 +751,7 @@ void MainWindow::openFile(const QString &path) {
     QSettings().setValue(QStringLiteral("lastDirectory"), info.absolutePath());
     m_fileLabel->setText(QStringLiteral("%1  ·  %2").arg(info.fileName(), formatBytes(info.size())));
     m_fileLabel->setToolTip(m_lastPath);
-    m_status->setText(QStringLiteral("正在后台解析码流单元、帧头和参考关系…"));
+    setActivityStatus(QStringLiteral("正在后台解析码流单元、帧头和参考关系…"));
     m_progress->setRange(0, 0);
     m_progress->show();
     m_model->setStream({});
@@ -716,7 +774,7 @@ void MainWindow::parseFinished() {
     m_stream = m_watcher.result();
     if (!m_stream || !m_stream->error.isEmpty()) {
         const QString error = m_stream ? m_stream->error : QStringLiteral("未知错误");
-        m_status->setText(QStringLiteral("解析失败：%1").arg(error));
+        setActivityStatus(QStringLiteral("解析失败：%1").arg(error));
         QMessageBox::warning(this, QStringLiteral("解析失败"), error);
         return;
     }
@@ -758,7 +816,7 @@ void MainWindow::parseFinished() {
         populateFileView();
     }
     updateMetrics();
-    m_status->setText(QStringLiteral("解析完成 · %1 帧 · %2 个%3%4 · 预览将按可见范围加载")
+    setActivityStatus(QStringLiteral("解析完成 · %1 帧 · %2 个%3%4 · 预览将按可见范围加载")
         .arg(m_stream->frames.size()).arg(m_stream->nals.size())
         .arg(mpeg4 ? QStringLiteral("起始码单元") : (av1 ? QStringLiteral(" OBU") : QStringLiteral(" NAL")))
         .arg(m_stream->containerFile ? QStringLiteral(" · %1 个顶层 MP4 Box").arg(m_stream->boxes.size()) : QString()));
@@ -873,6 +931,7 @@ void MainWindow::showFileBox(QTreeWidgetItem *item)
     if (!selected)
         return;
     m_currentFrame = -1;
+    refreshStatus();
     m_syntax->clear();
     auto *root = new QTreeWidgetItem(m_syntax, {
         QStringLiteral("Box %1").arg(selected->type), QString::number(selected->size),
@@ -940,11 +999,11 @@ void MainWindow::showFrame(int frameIndex) {
     if (!m_stream || frameIndex < 0 || frameIndex >= m_stream->frames.size()) return;
     const FrameInfo &frame = m_stream->frames.at(frameIndex);
     m_currentFrame = frameIndex;
+    refreshStatus();
     m_macroView->setFrame(frameIndex);
     const QImage cached = m_model->thumbnail(frameIndex);
     if (!cached.isNull()) m_macroView->setFrameImage(frameIndex, cached);
     if (cached.isNull()) {
-        m_model->setThumbnailError(frameIndex, {});
         m_previews->requestFrame(frameIndex);
     }
     else requestCurrentBlockData(frameIndex);
@@ -1080,6 +1139,7 @@ void MainWindow::showNal(int nalIndex) {
     for (const FrameInfo &frame : m_stream->frames) if (frame.nalIndices.contains(nalIndex)) { owner = frame.index; break; }
     if (owner >= 0) {
         m_currentFrame = owner;
+        refreshStatus();
         m_macroView->setFrame(owner);
         const QImage cached = m_model->thumbnail(owner);
         if (!cached.isNull()) m_macroView->setFrameImage(owner, cached);
@@ -1682,6 +1742,7 @@ void MainWindow::updateMetrics() {
 
 void MainWindow::clearDetails(const QString &message) {
     m_currentFrame = -1;
+    refreshStatus();
     if (m_frameStats)
         m_frameStats->setText(QStringLiteral("当前帧统计 · %1").arg(message.toHtmlEscaped()));
     m_slices->clear();
@@ -1705,7 +1766,7 @@ void MainWindow::dropEvent(QDropEvent *event) {
 }
 
 void MainWindow::closeEvent(QCloseEvent *event) {
-    if (m_watcher.isRunning()) m_status->setText(QStringLiteral("正在完成后台解析…"));
+    if (m_watcher.isRunning()) setActivityStatus(QStringLiteral("正在完成后台解析…"));
     QMainWindow::closeEvent(event);
 }
 

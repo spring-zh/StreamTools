@@ -26,6 +26,7 @@ qt_add_executable(BitScopeQt
     src/bitstreamparser.h
     src/bitstreamparser.cpp
     src/hevcaccess.h
+    src/mpeg4access.h
     src/frametablemodel.h
     src/frametablemodel.cpp
     src/previewprovider.h
@@ -138,6 +139,17 @@ install(SCRIPT ${deploy_script})
 option(BITSCOPE_BUILD_TESTS "Build BitScope smoke-test helpers" OFF)
 if(BITSCOPE_BUILD_TESTS)
     enable_testing()
+    # Exercise the actual window's signal wiring as well as decoder failures.
+    get_target_property(_bitscope_ui_sources BitScopeQt SOURCES)
+    list(FILTER _bitscope_ui_sources EXCLUDE REGEX "(^|/)main\\.cpp$")
+    list(FILTER _bitscope_ui_sources EXCLUDE REGEX "platformwindow_(mac|win)\\.(mm|cpp)$")
+    qt_add_executable(BitScopePreviewDiagnosticsTest
+        tests/previewdiagnostics_test.cpp ${_bitscope_ui_sources})
+    target_include_directories(BitScopePreviewDiagnosticsTest PRIVATE src)
+    target_link_libraries(BitScopePreviewDiagnosticsTest PRIVATE Qt6::Widgets Qt6::Concurrent)
+    target_compile_definitions(BitScopePreviewDiagnosticsTest PRIVATE QT_NO_KEYWORDS)
+    add_test(NAME preview-diagnostics COMMAND BitScopePreviewDiagnosticsTest)
+
     qt_add_executable(BitScopeWindowChromeTest
         tests/windowchrome_test.cpp
         src/windowtitlebar.h
