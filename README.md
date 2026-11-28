@@ -66,6 +66,48 @@
 公开或商业发行前，需按实际 Qt/FFmpeg 构建配置及依赖许可证补齐相关许可/源码材料。
 发布前还应在没有 Qt/Homebrew 的干净 Mac 上，实际验证各格式预览和块分析。
 
+#### GitHub Actions 手动编译 Mac 版本
+
+已提供 `.github/workflows/macos-build.yml`，**仅手动触发**，推送代码或标签不会自动构建。
+
+1. 将工作流及 `scripts`、`tests`、`third_party` 提交并推送；首次使用需将工作流合入默认分支。
+2. 打开 **Actions → macOS build and package → Run workflow**，选择分支及 `architecture`：
+   - `arm64`（默认）：Apple Silicon / M 系列，使用 `macos-15` runner。
+   - `x86_64`：Intel Mac，使用 `macos-15-intel` runner。
+   - `both`：分别构建上述两个版本，不是合并的 Universal App。
+3. 成功后在运行页面的 **Artifacts** 下载 `BitScope-macOS-架构-运行编号`。
+4. 解压下载文件，再解压内部的 `BitScope.zip`，将 `BitScope.app` 拷入应用程序文件夹。
+
+不需要配置额外 Secret。工作流安装官方 Qt 6.8.3 macOS 二进制，自动从固定提交构建
+带补丁的 HEVC / AV1 分析器，从 SHA-256 校验过的 FFmpeg 8.0.1 源码构建预览解码器，
+再调用现有 `package-macos.command`。不依赖 Homebrew 的 Qt/FFmpeg 运行库或 Intel 预编译包。
+缺少 CMake、pkg-config、NASM 时才通过 Homebrew 安装构建工具。
+`homebrew-versions.txt`、`dependencies.json` 和 `build-manifest.json` 记录构建环境、源码提交、补丁哈希及最低系统要求。
+成品包含运行依赖，使用者不需要安装 Homebrew、Qt 或 FFmpeg。
+CI 版 FFmpeg 仅包含本工具所需的四种视频解码、MP4/裸流输入、缩放和 JPEG 输出，不是通用转码工具。
+
+测试包括：脚本保护检查、界面控件回归、宏块日志解析、ZIP 解压及签名校验、
+打包主程序解析四种合成码流、四种编码的预览，以及 H.264/MPEG-4 宏块、HEVC CU、AV1 Block 提取。
+`tests/fixtures/codec-smoke.json` 保存可复现的合成测试视频及生成参数和校验值，不包含用户视频，
+因此 CI 不需要额外的视频编码器。
+测试从带空格的新路径执行，并移除 PATH 中的 Homebrew；测试驱动自身仍链接构建机 Qt，
+不能代替真实干净 Mac 上的验收。测试失败只上传诊断，不上传成功包；成品默认保存 14 天。
+
+默认 ad-hoc 签名，**未做 Apple 公证**，首次运行可能需要在“系统设置 → 隐私与安全性”允许打开。
+最低 macOS 版本以包内 `使用说明.txt` 为准，不保证支持构建环境之前的所有系统。
+工作流不发布 GitHub Release，也不修改仓库。私有仓库运行可能消耗 Actions 配额。
+
+本地全新克隆如需编译分析器，可安装依赖后执行：
+
+```bash
+brew install cmake qtbase pkgconf nasm
+python3 scripts/build_macos_deps.py --arch arm64 --jobs 3
+```
+
+Intel Mac 将 `arm64` 改为 `x86_64`。完成后根据输出的 `dependencies.json` 中路径，
+将 `hevc_analyzer`、`av1_inspect`、`ffmpeg` 分别传给打包脚本的
+`--hevc-analyzer`、`--av1-inspect`、`--ffmpeg`，并通过 `--dependency-notices` 传入该构建目录的 `licenses`。
+
 ### macOS / Linux
 
 ```bash
@@ -127,7 +169,7 @@ macOS 可运行 `build/BitScope.app`，Linux 通常运行 `build/BitScope`。也
 5. 在 Windows 10/11 x64 上运行 `BitScope.exe`。干净电脑可能需要先运行
    `prerequisites/VC_redist.x64.exe` 安装微软 C++ x64 运行库。
 
-工作流还会在 `main/master` 上的相关代码变更和 `v*` 标签推送时运行。
+工作流仅手动触发，代码变更和标签推送不会自动运行。
 只上传构建产物，不创建 GitHub Release、不推送代码；权限仅 `contents: read`。
 仓库或组织如限制 Actions，需要允许工作流引用的 `actions/*` 和 `jurplel/install-qt-action`。
 Actions 引用固定提交 SHA，两个分析器源码固定提交，FFmpeg 固定版本并校验 SHA-256。

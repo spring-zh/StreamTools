@@ -1,6 +1,8 @@
 """Pure-Python packaging guard tests; no Qt or macOS needed for these cases."""
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -12,6 +14,77 @@ SPEC.loader.exec_module(package)
 
 
 class PackagingTests(unittest.TestCase):
+    def test_qt68_help_exit_one_does_not_add_unsupported_signing_option(self):
+        help_text = "Usage: macdeployqt app-bundle [options]\n   -codesign=<ident> : Run codesign\n"
+        with patch.object(package.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, help_text)) as run:
+            self.assertEqual(package.macdeployqt_signing_options(Path("/Qt 6.8/bin/macdeployqt")), [])
+        self.assertEqual(run.call_args.args[0], ["/Qt 6.8/bin/macdeployqt", "-h"])
+        self.assertEqual(run.call_args.kwargs["stderr"], subprocess.STDOUT)
+
+    def test_newer_qt_explicitly_defers_signing_until_after_relocation(self):
+        help_text = "Usage: macdeployqt app-bundle [options]\n   -no-codesign : Disable code signing\n"
+        with patch.object(package.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, help_text)):
+            self.assertEqual(package.macdeployqt_signing_options(Path("macdeployqt")), ["-no-codesign"])
+
+    def test_broken_help_probe_is_not_mistaken_for_old_qt(self):
+        for code, output in ((1, "dyld: Library not loaded"), (-9, ""), (2, "Usage: macdeployqt")):
+            with self.subTest(code=code), patch.object(package.subprocess, "run", return_value=subprocess.CompletedProcess([], code, output)):
+                with self.assertRaisesRegex(RuntimeError, "无法读取 macdeployqt"):
+                    package.macdeployqt_signing_options(Path("macdeployqt"))
+
+    def test_deployment_preserves_spaces_helpers_and_plugins(self):
+        for options in ([], ["-no-codesign"]):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                app = Path(directory) / "folder with spaces/BitScope.app"
+                executables = [app / "Contents/MacOS/ffmpeg", app / "Contents/Resources/tools/HM_180",
+                               app / "Contents/Resources/tools/av1inspect", app / "Contents/PlugIns/platforms/libqcocoa.dylib"]
+                log_path = Path(directory) / "deployment.log"
+                with patch.object(package, "macdeployqt_signing_options", return_value=options), \
+                     patch.object(package.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+                    package.deploy_qt(Path("/Qt SDK/bin/macdeployqt"), app, Path("/Qt SDK"), executables, log_path)
+                self.assertEqual(run.call_args.args[0], ["/Qt SDK/bin/macdeployqt", str(app), *options,
+                                 "-no-plugins", "-verbose=2", "-libpath=/Qt SDK/lib",
+                                 *[f"-executable={p}" for p in executables]])
+                self.assertIn("Command:", log_path.read_text())
+
+    def test_deployment_failure_surfaces_log_and_does_not_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "deployment.log"
+
+            def fail(args, **kwargs):
+                kwargs["stdout"].write("first diagnostic\n" + "progress\n" * 150 + "ERROR: Missing framework\n")
+                return subprocess.CompletedProcess(args, 1)
+
+            with patch.object(package, "macdeployqt_signing_options", return_value=[]), \
+                 patch.object(package.subprocess, "run", side_effect=fail) as run:
+                with self.assertRaises(RuntimeError) as raised:
+                    package.deploy_qt(Path("macdeployqt"), Path("app"), Path("qt"), [], log_path)
+            self.assertIn("ERROR: Missing framework", str(raised.exception))
+            self.assertIn(str(log_path), str(raised.exception))
+            self.assertNotIn("first diagnostic", str(raised.exception))
+            self.assertIn("first diagnostic", log_path.read_text())
+            self.assertEqual(run.call_count, 1)
+
+    def test_github_outputs_preserve_spaces_and_existing_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "outputs"
+            output.write_text("previous=ok\n")
+            with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+                package.github_outputs({"zip-path": Path("/a folder/BitScope.zip")})
+            self.assertEqual(output.read_text(), "previous=ok\nzip-path=/a folder/BitScope.zip\n")
+
+    def test_github_outputs_reject_newline_injection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "outputs"
+            with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+                with self.assertRaisesRegex(RuntimeError, "single-line"):
+                    package.github_outputs({"path": "/tmp/file\nother=bad"})
+            self.assertFalse(output.exists())
+
+    def test_github_outputs_are_optional_for_local_builds(self):
+        with patch.dict(os.environ, {}, clear=True):
+            package.github_outputs({"zip-path": "/tmp/BitScope.zip"})
+
     def test_otool_parser_keeps_paths_with_spaces_and_excludes_id(self):
         library = "/a folder/libexample.dylib"
         outputs = [f"{library}:\n{library}\n",

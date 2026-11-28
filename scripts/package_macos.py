@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build a relocatable macOS folder; only the packaging machine needs Python/Qt."""
 import argparse
+from collections import deque
 import datetime
 import json
 import os
@@ -21,11 +22,57 @@ MACH_MAGICS = {bytes.fromhex(x) for x in (
     "cafebabf", "bfbafeca")}
 
 
-def run(args, capture=False, env=None):
+def run(args, capture=False, env=None, cwd=None):
     result = subprocess.run([str(x) for x in args], check=True, text=True,
                             stdout=subprocess.PIPE if capture else None,
-                            stderr=subprocess.PIPE if capture else None, env=env)
+                            stderr=subprocess.PIPE if capture else None, env=env, cwd=cwd)
     return result.stdout if capture else ""
+
+
+def macdeployqt_signing_options(deploy):
+    # Qt 6.8 defaults to no signing and rejects -no-codesign. Newer Qt
+    # defaults to ad-hoc signing. Detect the option instead of assuming a
+    # version; we sign the whole bundle ourselves after rewriting its paths.
+    result = subprocess.run([str(deploy), "-h"], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            check=False, timeout=30)
+    help_text = result.stdout or ""
+    # macdeployqt prints help to stderr and returns 1, including on Qt 6.8.
+    if result.returncode not in (0, 1) or "Usage: macdeployqt" not in help_text:
+        raise RuntimeError(f"无法读取 macdeployqt 支持的参数（退出码 {result.returncode}）：\n{help_text}")
+    return ["-no-codesign"] if re.search(r"(?m)^\s*-no-codesign\s*:", help_text) else []
+
+
+def deploy_qt(deploy, app, qt_prefix, executables, log_path):
+    args = [str(deploy), str(app), *macdeployqt_signing_options(deploy),
+            "-no-plugins", "-verbose=2", f"-libpath={qt_prefix / 'lib'}",
+            *[f"-executable={p}" for p in executables]]
+    with log_path.open("w", encoding="utf-8") as log:
+        log.write("Command: " + json.dumps(args, ensure_ascii=False) + "\n")
+        log.flush()
+        result = subprocess.run(args, stdout=log, stderr=subprocess.STDOUT, check=False)
+    if result.returncode != 0:
+        # Keep the full artifact, but also expose the real error in the Actions
+        # step output. A generic CalledProcessError hides all Qt diagnostics.
+        with log_path.open(encoding="utf-8", errors="replace") as log:
+            tail = "".join(deque(log, maxlen=120))
+        raise RuntimeError(f"macdeployqt 部署失败（退出码 {result.returncode}）。"
+                           f"完整日志：{log_path}\n最后 120 行：\n{tail}")
+
+
+def github_outputs(values):
+    """Expose exact successful build paths to CI, never select stale artifacts."""
+    destination = os.environ.get("GITHUB_OUTPUT")
+    if not destination:
+        return
+    lines = []
+    for key, value in values.items():
+        value = str(value)
+        if any(char in key + value for char in "\r\n"):
+            raise RuntimeError("GitHub output names and paths must be single-line")
+        lines.append(f"{key}={value}\n")
+    with open(destination, "a", encoding="utf-8") as stream:
+        stream.writelines(lines)
 
 
 def cache_value(cache, key):
@@ -230,6 +277,7 @@ def main():
     parser.add_argument("--ffmpeg", default=os.environ.get("BITSCOPE_FFMPEG"), help="macOS ffmpeg 可执行文件")
     parser.add_argument("--hevc-analyzer", help="带 BitScope 补丁的 HM_180")
     parser.add_argument("--av1-inspect", help="带 BitScope 补丁的 libaom inspect")
+    parser.add_argument("--dependency-notices", type=Path, help="额外依赖许可目录（CI 源码构建使用）")
     parser.add_argument("--arch", choices=("arm64", "x86_64"), default=platform.machine())
     parser.add_argument("--build-dir", type=Path, help="专用构建目录")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "dist", help="发布文件夹的父目录（不覆盖已有包）")
@@ -303,10 +351,7 @@ def main():
         plugin_sources.append(source)
     sources = collect_sources([app / "Contents/MacOS/BitScope", ffmpeg, hevc, av1, *plugin_sources], app, qt_prefix)
     print("[2/6] 收集 Qt、FFmpeg 及分析器的动态库…", flush=True)
-    with (output / "deployment.log").open("w") as log:
-        subprocess.run([str(deploy), str(app), "-no-codesign", "-no-plugins", "-verbose=2",
-                        f"-libpath={qt_prefix / 'lib'}",
-                        *[f"-executable={p}" for p in helpers + plugins]], stdout=log, stderr=subprocess.STDOUT, check=True)
+    deploy_qt(deploy, app, qt_prefix, helpers + plugins, output / "deployment.log")
     (app / "Contents/Resources/qt.conf").write_text("[Paths]\nPlugins = PlugIns\n", encoding="utf-8")
     print("[3/6] 修正路径，检查全部动态库和目标架构…", flush=True)
     files, minimum, records = relocate_and_audit(app, args.arch)
@@ -319,6 +364,8 @@ def main():
     with plist_path.open("wb") as stream:
         plistlib.dump(info, stream)
     notices = collect_notices(sources, app / "Contents/Resources/licenses/dependencies")
+    if args.dependency_notices:
+        shutil.copytree(args.dependency_notices, app / "Contents/Resources/licenses/ci-sources", symlinks=False)
     manifest = {"architecture": args.arch, "minimum_macos": minimum,
                 "signing": "ad-hoc" if args.sign_identity == "-" else args.sign_identity,
                 "notarized": False, "binaries": records, "dependency_sources": sorted(map(str, sources)),
@@ -358,6 +405,9 @@ def main():
     # Archive only user-facing deliverables, not paths/logs from the build host.
     run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", app, output / "BitScope.zip"])
     incomplete.unlink()
+    github_outputs({"package-dir": output, "zip-path": output / "BitScope.zip",
+                    "manifest-path": output / "build-manifest.json",
+                    "instructions-path": output / "使用说明.txt"})
     print(f"\n打包完成：{output}\n架构：{args.arch}；最低 macOS：{minimum}\n"
           "可复制 BitScope.app，或发送 BitScope.zip（未公证）。", flush=True)
 
@@ -365,7 +415,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (RuntimeError, OSError, subprocess.CalledProcessError) as error:
+    except (RuntimeError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         print(f"\n打包失败：{error}", file=sys.stderr)
         if isinstance(error, subprocess.CalledProcessError) and error.stderr:
             print(error.stderr, file=sys.stderr)

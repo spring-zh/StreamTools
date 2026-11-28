@@ -1,0 +1,131 @@
+name: macOS build and package
+
+on:
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: 'Mac architecture (arm64 = Apple Silicon, x86_64 = Intel)'
+        type: choice
+        default: arm64
+        options: [arm64, x86_64, both]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-package-${{ github.ref }}-${{ inputs.architecture }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(inputs.architecture == 'both' && '["arm64","x86_64"]' || inputs.architecture == 'x86_64' && '["x86_64"]' || '["arm64"]') }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'macos-15' || 'macos-15-intel' }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      TARGET_ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install native build dependencies
+        run: |
+          test "$(uname -m)" = "$TARGET_ARCH"
+          command -v cmake >/dev/null || brew install cmake
+          command -v pkg-config >/dev/null || brew install pkgconf
+          if [ "$TARGET_ARCH" = x86_64 ]; then
+            command -v nasm >/dev/null || brew install nasm
+          fi
+          mkdir -p build-macos-ci
+          brew list --versions > build-macos-ci/homebrew-versions.txt
+
+      - name: Install Qt 6.8.3 for macOS
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06 # v4.5.0
+        with:
+          version: '6.8.3'
+          host: mac
+          target: desktop
+          arch: clang_64
+          cache: true
+
+      - name: Check packaging scripts
+        run: python3 -m unittest discover -s tests -p 'test_*macos*.py' -v
+
+      - name: Build pinned HEVC, AV1 and FFmpeg dependencies
+        id: deps
+        run: |
+          python3 scripts/build_macos_deps.py --arch "$TARGET_ARCH" --jobs 3 2>&1 | tee build-macos-ci/dependencies.log
+
+      - name: Build regression test drivers
+        run: |
+          cmake -S . -B build-macos-ci/tests -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" -DCMAKE_OSX_ARCHITECTURES="$TARGET_ARCH" -DBITSCOPE_BUILD_TESTS=ON
+          cmake --build build-macos-ci/tests --parallel 3 --target \
+            BitScopeWindowChromeTest BitScopeMacroblockLogTest BitScopePreviewSmoke BitScopeHevcCuSmoke BitScopeAv1BlockSmoke
+          QT_QPA_PLATFORM=offscreen ctest --test-dir build-macos-ci/tests --output-on-failure
+
+      - name: Build and package relocatable app
+        id: package
+        env:
+          BITSCOPE_HEVC_ANALYZER: ${{ steps.deps.outputs.hevc-analyzer }}
+          BITSCOPE_AV1_INSPECT: ${{ steps.deps.outputs.av1-inspect }}
+          FFMPEG_EXE: ${{ steps.deps.outputs.ffmpeg }}
+          DEPENDENCY_NOTICES: ${{ steps.deps.outputs.notices-dir }}
+        run: |
+          bash ./package-macos.command --qt-prefix "$QT_ROOT_DIR" --ffmpeg "$FFMPEG_EXE" \
+            --dependency-notices "$DEPENDENCY_NOTICES" \
+            --arch "$TARGET_ARCH" --build-dir build-macos-ci/app --jobs 3 2>&1 | tee build-macos-ci/package.log
+
+      - name: Test extracted package and detailed block analysis
+        env:
+          PACKAGE_DIR: ${{ steps.package.outputs.package-dir }}
+        run: |
+          python3 scripts/test_macos_package.py --package-dir "$PACKAGE_DIR" \
+            --test-build build-macos-ci/tests 2>&1 | tee build-macos-ci/smoke-tests.log
+
+      - name: Prepare download folder
+        env:
+          PACKAGE_DIR: ${{ steps.package.outputs.package-dir }}
+          DEPENDENCIES_MANIFEST: ${{ steps.deps.outputs.manifest-path }}
+        run: |
+          mkdir -p build-macos-ci/artifact
+          cp "$PACKAGE_DIR/BitScope.zip" "$PACKAGE_DIR/使用说明.txt" \
+            "$PACKAGE_DIR/build-manifest.json" "$PACKAGE_DIR/smoke-tests.json" build-macos-ci/artifact/
+          cp "$DEPENDENCIES_MANIFEST" build-macos-ci/artifact/dependencies.json
+          cp build-macos-ci/homebrew-versions.txt build-macos-ci/artifact/
+
+      - name: Upload tested Mac package
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: BitScope-macOS-${{ matrix.arch }}-${{ github.run_number }}
+          path: build-macos-ci/artifact/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: macOS-build-diagnostics-${{ matrix.arch }}-${{ github.run_number }}
+          path: |
+            build-macos-ci/*.log
+            build-macos-ci/homebrew-versions.txt
+            build-macos*/**/CMakeConfigureLog.yaml
+            build-macos*/**/CMakeCache.txt
+            build-macos*/**/ffbuild/config.log
+            build-macos*/**/LastTest.log
+            dist/**/deployment.log
+            dist/**/INCOMPLETE.txt
+          if-no-files-found: ignore
+          retention-days: 7
